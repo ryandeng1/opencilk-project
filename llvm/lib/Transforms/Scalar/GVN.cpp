@@ -910,8 +910,8 @@ PreservedAnalyses GVNPass::run(Function &F, FunctionAnalysisManager &AM) {
   if (MSSA)
     PA.preserve<MemorySSAAnalysis>();
   PA.preserve<LoopAnalysis>();
-  if (TI)
-    PA.preserve<TaskAnalysis>();
+  // if (TI)
+  //   PA.preserve<TaskAnalysis>();
   return PA;
 }
 
@@ -2880,6 +2880,10 @@ bool GVNPass::runImpl(Function &F, AssumptionCache &RunAC, DominatorTree &RunDT,
     Changed |= RemovedBlock;
   }
   DTU.flush();
+
+  if (TI && Changed)
+    // Recompute task info here to avoid stale TaskInfo being used for analysis below
+    TI->recalculate(F, *DT);
 
   unsigned Iteration = 0;
   while (ShouldContinue) {

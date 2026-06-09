@@ -283,6 +283,10 @@ public:
 
   const Loop *getInnermostLoop() const { return InnermostLoop; }
 
+  /// Optional Tapir TaskInfo for the function, used to recognize logically
+  /// parallel (data-race-free) loops.  May be null.
+  TaskInfo *getTaskInfo() const { return TI; }
+
   DenseMap<std::pair<const SCEV *, Type *>,
            std::pair<const SCEV *, const SCEV *>> &
   getPointerBounds() {
@@ -473,16 +477,33 @@ typedef std::pair<const RuntimeCheckingPtrGroup *,
                   const RuntimeCheckingPtrGroup *>
     RuntimePointerCheck;
 
+/// The kind of comparison a PointerDiffInfo lowers to.
+enum class PointerDiffCheckKind {
+  /// Conflict when 0 <= (SinkStart - SrcStart) < VF * IC * AccessSize, the
+  /// standard dependence-distance check used to enable vectorization.
+  VectorDistance,
+  /// Conflict only when SinkStart == SrcStart.  Sound only for data-race-free
+  /// (Tapir-parallel) loops: two lockstep, every-iteration accesses to objects
+  /// that are exact-equal-or-disjoint (any partial overlap would be a cross-
+  /// iteration race the DRF assumption forbids), so a nonzero base difference
+  /// implies the objects are disjoint.  See tryToCreateDRFEqualityCheck and
+  /// addDiffRuntimeChecks.
+  DRFExactEquality,
+};
+
 struct PointerDiffInfo {
   const SCEV *SrcStart;
   const SCEV *SinkStart;
   unsigned AccessSize;
   bool NeedsFreeze;
+  PointerDiffCheckKind Kind;
 
-  PointerDiffInfo(const SCEV *SrcStart, const SCEV *SinkStart,
-                  unsigned AccessSize, bool NeedsFreeze)
+  PointerDiffInfo(
+      const SCEV *SrcStart, const SCEV *SinkStart, unsigned AccessSize,
+      bool NeedsFreeze,
+      PointerDiffCheckKind Kind = PointerDiffCheckKind::VectorDistance)
       : SrcStart(SrcStart), SinkStart(SinkStart), AccessSize(AccessSize),
-        NeedsFreeze(NeedsFreeze) {}
+        NeedsFreeze(NeedsFreeze), Kind(Kind) {}
 };
 
 /// Holds information about the memory runtime legality checks to verify
@@ -568,6 +589,18 @@ public:
     return {DiffChecks};
   }
 
+  /// Return true if the available pointer-difference checks prove the same
+  /// full-loop noalias fact as the ordinary range checks.  Standard
+  /// VectorDistance checks only prove that the chosen VF/IC is dependence-free,
+  /// but DRFExactEquality checks reject the only race-free aliasing case and
+  /// therefore make the guarded clone a true noalias clone.
+  bool diffChecksImplyNoAlias() const {
+    return CanUseDiffCheck && !DiffChecks.empty() &&
+           all_of(DiffChecks, [](const PointerDiffInfo &Check) {
+             return Check.Kind == PointerDiffCheckKind::DRFExactEquality;
+           });
+  }
+
   /// Decide if we need to add a check between two groups of pointers,
   /// according to needsChecking.
   LLVM_ABI bool needsChecking(const RuntimeCheckingPtrGroup &M,
@@ -629,6 +662,23 @@ private:
   /// checks cannot be used for the groups, set CanUseDiffCheck to false.
   bool tryToCreateDiffCheck(const RuntimeCheckingPtrGroup &CGI,
                             const RuntimeCheckingPtrGroup &CGJ);
+
+  /// For a data-race-free (Tapir-parallel) loop, try to add a DRFExactEquality
+  /// pointer-difference check for checking groups \p CGI and \p CGJ: the two
+  /// groups must each reference a single object accessed via a lockstep affine
+  /// add-rec (matching step equal to the access size), with at least one write.
+  /// Under the DRF assumption such a pair is exact-equal-or-disjoint, so a
+  /// single base-equality comparison suffices.  Unlike tryToCreateDiffCheck
+  /// this tolerates a read-modify-write object (a group whose members all name
+  /// the same pointer).  Returns true and appends a DiffCheck on success.
+  bool tryToCreateDRFEqualityCheck(const RuntimeCheckingPtrGroup &CGI,
+                                   const RuntimeCheckingPtrGroup &CGJ);
+
+  /// Return true if every member pair represented by this grouped runtime
+  /// check is proven independent by DRFAA or by an LAA-specific DRF
+  /// loop-carried-dependence proof.
+  bool canElideCheckWithDRFAA(const RuntimeCheckingPtrGroup &CGI,
+                              const RuntimeCheckingPtrGroup &CGJ) const;
 
   MemoryDepChecker &DC;
 

@@ -23,6 +23,13 @@ class Function;
 class ScalarEvolution;
 class SCEV;
 
+/// Try to answer an alias query using direct ScalarEvolution reasoning about
+/// the relative distance between two pointers. Returns \c MayAlias if no
+/// definitive result is available.
+LLVM_ABI AliasResult aliasBasedOnScalarEvolution(ScalarEvolution &SE,
+                                                 const MemoryLocation &LocA,
+                                                 const MemoryLocation &LocB);
+
 /// A simple alias analysis implementation that uses ScalarEvolution to answer
 /// queries.
 class SCEVAAResult : public AAResultBase {

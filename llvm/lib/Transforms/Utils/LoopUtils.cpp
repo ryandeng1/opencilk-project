@@ -2129,24 +2129,35 @@ Value *llvm::addDiffRuntimeChecks(
   // Map to keep track of created compares, The key is the pair of operands for
   // the compare, to allow detecting and re-using redundant compares.
   DenseMap<std::pair<Value *, Value *>, Value *> SeenCompares;
-  for (const auto &[SrcStart, SinkStart, AccessSize, NeedsFreeze] : Checks) {
+  for (const auto &[SrcStart, SinkStart, AccessSize, NeedsFreeze, Kind] :
+       Checks) {
     Type *Ty = SinkStart->getType();
-    // Compute VF * IC * AccessSize.
-    auto *VFTimesICTimesSize =
-        ChkBuilder.CreateMul(GetVF(ChkBuilder, Ty->getScalarSizeInBits()),
-                             ConstantInt::get(Ty, IC * AccessSize));
     Value *Diff =
         Expander.expandCodeFor(SE.getMinusSCEV(SinkStart, SrcStart), Ty, Loc);
 
+    // The right-hand side of the comparison; also the second half of the
+    // dedup key (null for the equality check, which has no bound operand).
+    Value *Bound = nullptr;
+    if (Kind == PointerDiffCheckKind::VectorDistance)
+      // Compute VF * IC * AccessSize.
+      Bound = ChkBuilder.CreateMul(GetVF(ChkBuilder, Ty->getScalarSizeInBits()),
+                                   ConstantInt::get(Ty, IC * AccessSize));
+
     // Check if the same compare has already been created earlier. In that case,
     // there is no need to check it again.
-    Value *IsConflict = SeenCompares.lookup({Diff, VFTimesICTimesSize});
+    Value *IsConflict = SeenCompares.lookup({Diff, Bound});
     if (IsConflict)
       continue;
 
-    IsConflict =
-        ChkBuilder.CreateICmpULT(Diff, VFTimesICTimesSize, "diff.check");
-    SeenCompares.insert({{Diff, VFTimesICTimesSize}, IsConflict});
+    if (Kind == PointerDiffCheckKind::DRFExactEquality)
+      // The objects are exact-equal-or-disjoint under the DRF assumption, so a
+      // zero base difference (exact overlap) is the only conflict; any nonzero
+      // difference proves they are disjoint.
+      IsConflict =
+          ChkBuilder.CreateICmpEQ(Diff, ConstantInt::get(Ty, 0), "drf.eq.check");
+    else
+      IsConflict = ChkBuilder.CreateICmpULT(Diff, Bound, "diff.check");
+    SeenCompares.insert({{Diff, Bound}, IsConflict});
     if (NeedsFreeze)
       IsConflict =
           ChkBuilder.CreateFreeze(IsConflict, IsConflict->getName() + ".fr");

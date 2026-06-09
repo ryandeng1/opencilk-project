@@ -22,6 +22,7 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/DataRaceFreeAliasAnalysis.h"
 #include "llvm/Analysis/AliasSetTracker.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -148,10 +149,30 @@ static cl::opt<bool, true> HoistRuntimeChecks(
 bool VectorizerParams::HoistRuntimeChecks;
 
 /// Enable analysis using Tapir based on the data-race-free assumption.
-static cl::opt<bool> EnableDRFAA(
+static cl::opt<bool> EnableDRFLAA(
     "enable-drf-laa", cl::Hidden,
     cl::desc("Enable analysis using Tapir based on the data-race-free "
              "assumption"),
+    cl::init(false));
+
+/// Let LAA selectively drop runtime pointer-check pairs when DRFAA can prove
+/// that any overlap would imply a forbidden parallel race. This is narrower
+/// than -enable-drf-laa: it does not globally classify Tapir-loop dependences
+/// as safe, and it leaves ordinary LAA versioning/checks intact for pairs DRFAA
+/// cannot prove.
+static cl::opt<bool> EnableDRFCheckElision(
+    "enable-drf-laa-check-elision", cl::Hidden,
+    cl::desc("Use DRFAA to selectively elide LAA runtime pointer-check pairs"),
+    cl::init(false));
+
+/// For data-race-free (Tapir-parallel) loops, emit cheap base-equality runtime
+/// alias checks for both-vary lockstep accesses (including read-modify-write
+/// accumulators) instead of falling back to full range checks.
+static cl::opt<bool> EnableDRFEqualityVersioning(
+    "enable-drf-equality-versioning", cl::Hidden,
+    cl::desc("For data-race-free (Tapir-parallel) loops, emit base-equality "
+             "runtime alias checks for both-vary lockstep accesses instead of "
+             "full range checks"),
     cl::init(false));
 
 bool VectorizerParams::isInterleaveForced() {
@@ -479,6 +500,274 @@ bool RuntimePointerChecking::tryToCreateDiffCheck(
   return true;
 }
 
+static bool isLogicallyParallelViaTapir(const Loop *L, TaskInfo *TI);
+
+bool RuntimePointerChecking::tryToCreateDRFEqualityCheck(
+    const RuntimeCheckingPtrGroup &CGI, const RuntimeCheckingPtrGroup &CGJ) {
+  if (!EnableDRFEqualityVersioning)
+    return false;
+
+  const Loop *InnerLoop = DC.getInnermostLoop();
+  if (!InnerLoop || !isLogicallyParallelViaTapir(InnerLoop, DC.getTaskInfo()))
+    return false;
+
+  // We compare the two objects' base addresses, so they must share an address
+  // space.
+  if (CGI.AddressSpace != CGJ.AddressSpace)
+    return false;
+
+  // Each group must reference a single object.  Unlike tryToCreateDiffCheck we
+  // tolerate a read-modify-write object, i.e. a group whose members are a read
+  // and a write of the *same* pointer (e.g. a[i] += ...): a single base-
+  // equality comparison still covers both accesses.
+  auto getSoleMember = [&](const RuntimeCheckingPtrGroup &CG,
+                           bool &HasWrite) -> const PointerInfo * {
+    HasWrite = false;
+    const PointerInfo *Rep = nullptr;
+    for (unsigned Idx : CG.Members) {
+      const PointerInfo &PI = Pointers[Idx];
+      if (Rep && Rep->PointerValue != PI.PointerValue)
+        return nullptr;
+      if (!Rep)
+        Rep = &PI;
+      HasWrite |= PI.IsWritePtr;
+    }
+    return Rep;
+  };
+
+  bool IWrite = false, JWrite = false;
+  const PointerInfo *PII = getSoleMember(CGI, IWrite);
+  const PointerInfo *PIJ = getSoleMember(CGJ, JWrite);
+  if (!PII || !PIJ)
+    return false;
+
+  // DRF only forbids *racing* overlaps, so at least one access must write; two
+  // reads to the same object are race-free and may legitimately alias.
+  if (!IWrite && !JWrite)
+    return false;
+
+  // Both accesses must be affine add-recs in the loop with the same step (they
+  // sweep their objects in lockstep).  An invariant operand is not an add-rec
+  // here and is handled by alias analysis, not by this check.
+  const SCEVConstant *Step;
+  const SCEV *IStart;
+  const SCEV *JStart;
+  if (!match(PII->Expr,
+             m_scev_AffineAddRec(m_SCEV(IStart), m_SCEVConstant(Step),
+                                 m_SpecificLoop(InnerLoop))) ||
+      !match(PIJ->Expr,
+             m_scev_AffineAddRec(m_SCEV(JStart), m_scev_Specific(Step),
+                                 m_SpecificLoop(InnerLoop))))
+    return false;
+
+  // Look up the access type/size for each object.
+  auto getAccessTy = [&](Value *Ptr) -> Type * {
+    for (bool IsWrite : {true, false}) {
+      // getInstructionsForAccess asserts if the (ptr, kind) pair was never
+      // recorded, so probe with getOrderForAccess first.
+      if (DC.getOrderForAccess(Ptr, IsWrite).empty())
+        continue;
+      SmallVector<Instruction *, 4> Insts =
+          DC.getInstructionsForAccess(Ptr, IsWrite);
+      if (!Insts.empty())
+        return getLoadStoreType(Insts[0]);
+    }
+    return nullptr;
+  };
+  Type *ITy = getAccessTy(PII->PointerValue);
+  Type *JTy = getAccessTy(PIJ->PointerValue);
+  if (!ITy || !JTy || isa<ScalableVectorType>(ITy) ||
+      isa<ScalableVectorType>(JTy))
+    return false;
+
+  const DataLayout &DL = InnerLoop->getHeader()->getDataLayout();
+  unsigned ISize = DL.getTypeAllocSize(ITy);
+  unsigned JSize = DL.getTypeAllocSize(JTy);
+
+  // Require equal access size and step == size, so consecutive iterations tile
+  // each object exactly.  Then DRF leaves only two possibilities: exact base
+  // equality (race-free, identical addresses every iteration) or full
+  // disjointness -- any sub-element or shifted overlap would put a write and a
+  // read of the shared byte in distinct, parallel iterations, a race the DRF
+  // assumption forbids.  So a single base-equality comparison discriminates the
+  // only two cases, with no need for the access ranges.
+  //
+  // TODO: Discharge the small-trip-count boundary cases explicitly.  This is
+  // currently intended for profitable parallel loops with enough dynamic
+  // iterations for a shifted overlap to have a sibling-iteration witness.
+  if (ISize != JSize || Step->getAPInt().abs() != ISize)
+    return false;
+
+  IntegerType *IntTy =
+      IntegerType::get(PII->PointerValue->getContext(),
+                       DL.getPointerSizeInBits(CGI.AddressSpace));
+  const SCEV *ISInt = SE->getPtrToIntExpr(IStart, IntTy);
+  const SCEV *JSInt = SE->getPtrToIntExpr(JStart, IntTy);
+  if (isa<SCEVCouldNotCompute>(ISInt) || isa<SCEVCouldNotCompute>(JSInt))
+    return false;
+
+  LLVM_DEBUG(dbgs() << "LAA: Creating DRF base-equality runtime check for:\n"
+                    << "  Start I: " << *ISInt << '\n'
+                    << "  Start J: " << *JSInt << '\n');
+  DiffChecks.emplace_back(ISInt, JSInt, ISize,
+                          PII->NeedsFreeze || PIJ->NeedsFreeze,
+                          PointerDiffCheckKind::DRFExactEquality);
+  return true;
+}
+
+bool RuntimePointerChecking::canElideCheckWithDRFAA(
+    const RuntimeCheckingPtrGroup &CGI,
+    const RuntimeCheckingPtrGroup &CGJ) const {
+  if (!EnableDRFCheckElision)
+    return false;
+
+  TaskInfo *TI = DC.getTaskInfo();
+  const Loop *InnerLoop = DC.getInnermostLoop();
+  if (!TI || !InnerLoop)
+    return false;
+
+  const DataLayout &DL = InnerLoop->getHeader()->getDataLayout();
+
+  auto IsDenseLockstepReadBeforeWrite = [&](const PointerInfo &PI,
+                                            unsigned IOrder,
+                                            Instruction *IInst,
+                                            const PointerInfo &PJ,
+                                            unsigned JOrder,
+                                            Instruction *JInst) {
+    // This is an LAA-specific proof, not a general NoAlias fact. Runtime
+    // pointer checks here protect the vectorized loop from loop-carried
+    // conflicts. If two dense lockstep accesses overlap at a shifted lane, the
+    // overlap is between distinct Tapir iterations and DRF forbids it. The only
+    // race-free overlap left is exact same-lane equality, which is safe for
+    // vectorization only when the source read precedes the sink write.
+    if (PI.IsWritePtr == PJ.IsWritePtr)
+      return false;
+
+    unsigned LoadOrder = PI.IsWritePtr ? JOrder : IOrder;
+    unsigned StoreOrder = PI.IsWritePtr ? IOrder : JOrder;
+    if (StoreOrder <= LoadOrder)
+      return false;
+
+    if (!InnerLoop->contains(IInst->getParent()) ||
+        !InnerLoop->contains(JInst->getParent()) ||
+        !(TI->isLoopCarriedLogicallyParallelViaLoop(IInst, JInst, InnerLoop) ||
+          isLogicallyParallelViaTapir(InnerLoop, TI)))
+      return false;
+
+    const SCEVConstant *Step;
+    const SCEV *IStart;
+    const SCEV *JStart;
+    if (!match(PI.Expr,
+               m_scev_AffineAddRec(m_SCEV(IStart), m_SCEVConstant(Step),
+                                   m_SpecificLoop(InnerLoop))) ||
+        !match(PJ.Expr,
+               m_scev_AffineAddRec(m_SCEV(JStart), m_scev_Specific(Step),
+                                   m_SpecificLoop(InnerLoop))))
+      return false;
+
+    Type *ITy = getLoadStoreType(IInst);
+    Type *JTy = getLoadStoreType(JInst);
+    if (isa<ScalableVectorType>(ITy) || isa<ScalableVectorType>(JTy))
+      return false;
+
+    unsigned ISize = DL.getTypeAllocSize(ITy);
+    unsigned JSize = DL.getTypeAllocSize(JTy);
+    if (ISize != JSize || Step->getAPInt().abs() != ISize)
+      return false;
+
+    IntegerType *IntTy = IntegerType::get(
+        PI.PointerValue->getContext(),
+        DL.getPointerSizeInBits(PI.PointerValue->getType()
+                                    ->getPointerAddressSpace()));
+    const SCEV *IStartInt = SE->getPtrToIntExpr(IStart, IntTy);
+    const SCEV *JStartInt = SE->getPtrToIntExpr(JStart, IntTy);
+    if (isa<SCEVCouldNotCompute>(IStartInt) ||
+        isa<SCEVCouldNotCompute>(JStartInt))
+      return false;
+
+    // If SCEV can already prove the lanes start at different addresses, keep
+    // LAA's ordinary versioning path. That path can be profitable because it
+    // supplies alias scopes for the guarded clone (for example in trmm). This
+    // loop-carried elision is reserved for cases where exact same-lane equality
+    // remains possible and the runtime check is only blocking shifted-lane
+    // conflicts that DRF rules out.
+    if (SE->isKnownNonZero(SE->getMinusSCEV(IStartInt, JStartInt)))
+      return false;
+
+    // Avoid suppressing LAA versioning for a Tapir loop nested inside a serial
+    // loop. In those cases (for example trmm) the ordinary versioned clone can
+    // expose profitable alias scopes for the surrounding serial computation.
+    // Floyd-style nested Tapir loops still pass this guard.
+    if (const Loop *Parent = InnerLoop->getParentLoop())
+      if (!isLogicallyParallelViaTapir(Parent, TI))
+        return false;
+
+    return true;
+  };
+
+  bool SawRequiredPair = false;
+  bool UsedLoopCarriedProof = false;
+  for (unsigned I : CGI.Members) {
+    for (unsigned J : CGJ.Members) {
+      if (!needsChecking(I, J))
+        continue;
+
+      SawRequiredPair = true;
+      const PointerInfo &PI = Pointers[I];
+      const PointerInfo &PJ = Pointers[J];
+
+      ArrayRef<unsigned> IOrders =
+          DC.getOrderForAccess(PI.PointerValue, PI.IsWritePtr);
+      ArrayRef<unsigned> JOrders =
+          DC.getOrderForAccess(PJ.PointerValue, PJ.IsWritePtr);
+      if (IOrders.empty() || JOrders.empty())
+        return false;
+
+      SmallVector<Instruction *, 4> IInsts =
+          DC.getInstructionsForAccess(PI.PointerValue, PI.IsWritePtr);
+      SmallVector<Instruction *, 4> JInsts =
+          DC.getInstructionsForAccess(PJ.PointerValue, PJ.IsWritePtr);
+      if (IOrders.size() != IInsts.size() || JOrders.size() != JInsts.size())
+        return false;
+
+      for (unsigned II = 0, IE = IInsts.size(); II != IE; ++II) {
+        Instruction *IInst = IInsts[II];
+        std::optional<MemoryLocation> ILoc = MemoryLocation::getOrNone(IInst);
+        if (!ILoc)
+          return false;
+        for (unsigned JI = 0, JE = JInsts.size(); JI != JE; ++JI) {
+          Instruction *JInst = JInsts[JI];
+          std::optional<MemoryLocation> JLoc = MemoryLocation::getOrNone(JInst);
+          if (!JLoc)
+            return false;
+
+          if (drfAliasWouldImplyParallelRace(*TI, *ILoc, *JLoc, IInst, JInst,
+                                             *SE))
+            continue;
+
+          if (!IsDenseLockstepReadBeforeWrite(PI, IOrders[II], IInst, PJ,
+                                              JOrders[JI], JInst))
+            return false;
+          UsedLoopCarriedProof = true;
+        }
+      }
+    }
+  }
+
+  if (!SawRequiredPair)
+    return false;
+
+  LLVM_DEBUG(dbgs() << "LAA: Eliding runtime check with "
+                    << (UsedLoopCarriedProof ? "DRF loop-carried proof"
+                                             : "DRFAA noalias proof")
+                    << ":\n"
+                    << "  Group I low/high: " << *CGI.Low << " / "
+                    << *CGI.High << '\n'
+                    << "  Group J low/high: " << *CGJ.Low << " / "
+                    << *CGJ.High << '\n');
+  return true;
+}
+
 SmallVector<RuntimePointerCheck, 4> RuntimePointerChecking::generateChecks() {
   SmallVector<RuntimePointerCheck, 4> Checks;
 
@@ -488,7 +777,12 @@ SmallVector<RuntimePointerCheck, 4> RuntimePointerChecking::generateChecks() {
       const RuntimeCheckingPtrGroup &CGJ = CheckingGroups[J];
 
       if (needsChecking(CGI, CGJ)) {
-        CanUseDiffCheck = CanUseDiffCheck && tryToCreateDiffCheck(CGI, CGJ);
+        if (canElideCheckWithDRFAA(CGI, CGJ))
+          continue;
+
+        CanUseDiffCheck = CanUseDiffCheck &&
+                          (tryToCreateDRFEqualityCheck(CGI, CGJ) ||
+                           tryToCreateDiffCheck(CGI, CGJ));
         Checks.emplace_back(&CGI, &CGJ);
       }
     }
@@ -2018,7 +2312,7 @@ MemoryDepChecker::getDependenceDistanceStrideAndSize(
 
   // Under certain assumptions, Tapir can guarantee that there are no
   // loop-carried dependencies.
-  if (EnableDRFAA && isLogicallyParallelViaTapir(InnermostLoop, TI))
+  if (EnableDRFLAA && isLogicallyParallelViaTapir(InnermostLoop, TI))
     return MemoryDepChecker::Dependence::NoDep;
 
   // We cannot check pointers in different address spaces.
@@ -2496,7 +2790,7 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
   PtrRtChecking->Need = false;
 
   const bool IsAnnotatedParallel = TheLoop->isAnnotatedParallel() ||
-    (EnableDRFAA && isLogicallyParallelViaTapir(TheLoop, TI));
+    (EnableDRFLAA && isLogicallyParallelViaTapir(TheLoop, TI));
 
   const bool EnableMemAccessVersioningOfLoop =
       EnableMemAccessVersioning &&

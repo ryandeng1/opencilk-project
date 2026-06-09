@@ -296,11 +296,24 @@ instructionClobbersQuery(const MemoryDef *MD, const MemoryLocation &UseLoc,
   Instruction *DefInst = MD->getMemoryInst();
   assert(DefInst && "Defining instruction not actually an instruction");
 
-  if (TI && EnableDRF)
-    if ((TI->getTaskFor(MD->getBlock()) !=
-         TI->getTaskFor(UseInst->getParent())) &&
+  // Some MemorySSA clobber queries originate from an explicit MemoryLocation
+  // rather than a concrete use instruction. In that case, there is no valid
+  // instruction context to map into the task forest, so skip the DRF shortcut.
+  if (TI && EnableDRF && UseInst && UseInst->getParent()) {
+    const Task *DefTask = TI->getTaskFor(MD->getBlock());
+    const Task *UseTask = TI->getTaskFor(UseInst->getParent());
+
+    // Only suppress clobbers for accesses in disjoint parallel tasks.  The
+    // may-happen-in-parallel relation is intentionally coarse and can relate a
+    // nested task to its enclosing task.  Treating ancestor/descendant task
+    // pairs as independent lets EarlyCSE reuse values across serial code that
+    // runs before the nested detach, which miscompiles kernels like
+    // gramschmidt.
+    if (DefTask != UseTask && !TI->encloses(DefTask, UseTask) &&
+        !TI->encloses(UseTask, DefTask) &&
         TI->mayHappenInParallel(MD->getBlock(), UseInst->getParent()))
       return false;
+  }
 
   // Check for invokes of detached.rethrow, taskframe.resume, or sync.unwind.
   if (const InvokeInst *II = dyn_cast<InvokeInst>(DefInst))

@@ -23,6 +23,10 @@ if (DEFINED LLVM_HAVE_TF_AOT OR LLVM_HAVE_TFLITE)
   endif()
 endif()
 
+include_directories(BEFORE
+  ${LLVM_MAIN_SRC_DIR}/../mlir/include
+)
+
 # The implementation of ConstantFolding.cpp relies on the use of math functions
 # from the host. In particular, it relies on the detection of floating point
 # exceptions originating from such math functions to prevent invalid cases
@@ -60,6 +64,16 @@ add_llvm_component_library(LLVMAnalysis
   CtxProfAnalysis.cpp
   CycleAnalysis.cpp
   DataRaceFreeAliasAnalysis.cpp
+  ${LLVM_MAIN_SRC_DIR}/../mlir/lib/Analysis/Presburger/Barvinok.cpp
+  ${LLVM_MAIN_SRC_DIR}/../mlir/lib/Analysis/Presburger/IntegerRelation.cpp
+  ${LLVM_MAIN_SRC_DIR}/../mlir/lib/Analysis/Presburger/LinearTransform.cpp
+  ${LLVM_MAIN_SRC_DIR}/../mlir/lib/Analysis/Presburger/Matrix.cpp
+  ${LLVM_MAIN_SRC_DIR}/../mlir/lib/Analysis/Presburger/PresburgerRelation.cpp
+  ${LLVM_MAIN_SRC_DIR}/../mlir/lib/Analysis/Presburger/PresburgerSpace.cpp
+  ${LLVM_MAIN_SRC_DIR}/../mlir/lib/Analysis/Presburger/PWMAFunction.cpp
+  ${LLVM_MAIN_SRC_DIR}/../mlir/lib/Analysis/Presburger/QuasiPolynomial.cpp
+  ${LLVM_MAIN_SRC_DIR}/../mlir/lib/Analysis/Presburger/Simplex.cpp
+  ${LLVM_MAIN_SRC_DIR}/../mlir/lib/Analysis/Presburger/Utils.cpp
   DDG.cpp
   DDGPrinter.cpp
   ConstraintSystem.cpp

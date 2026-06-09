@@ -64,8 +64,19 @@ void LoopVersioning::versionLoop(
   SCEVExpander Exp2(*RtPtrChecking.getSE(),
                     VersionedLoop->getHeader()->getDataLayout(),
                     "induction");
-  MemRuntimeCheck = addRuntimeChecks(RuntimeCheckBB->getTerminator(),
-                                     VersionedLoop, AliasChecks, Exp2);
+  if (RtPtrChecking.Need && RtPtrChecking.diffChecksImplyNoAlias()) {
+    auto DiffChecks = RtPtrChecking.getDiffChecks();
+    assert(DiffChecks && "expected available DRF equality checks");
+    MemRuntimeCheck = addDiffRuntimeChecks(
+        RuntimeCheckBB->getTerminator(), *DiffChecks, Exp2,
+        [](IRBuilderBase &B, unsigned Bits) {
+          return ConstantInt::get(B.getIntNTy(Bits), 1);
+        },
+        /*IC=*/1);
+  } else {
+    MemRuntimeCheck = addRuntimeChecks(RuntimeCheckBB->getTerminator(),
+                                       VersionedLoop, AliasChecks, Exp2);
+  }
 
   SCEVExpander Exp(*SE, RuntimeCheckBB->getDataLayout(),
                    "scev.check");

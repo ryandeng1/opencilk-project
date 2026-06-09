@@ -33,9 +33,9 @@ static bool canComputePointerDiff(ScalarEvolution &SE,
   return SE.instructionCouldExistWithOperands(A, B);
 }
 
-AliasResult SCEVAAResult::alias(const MemoryLocation &LocA,
-                                const MemoryLocation &LocB, AAQueryInfo &AAQI,
-                                const Instruction *) {
+AliasResult llvm::aliasBasedOnScalarEvolution(ScalarEvolution &SE,
+                                              const MemoryLocation &LocA,
+                                              const MemoryLocation &LocB) {
   // If either of the memory references is empty, it doesn't matter what the
   // pointer values are. This allows the code below to ignore this special
   // case.
@@ -100,6 +100,19 @@ AliasResult SCEVAAResult::alias(const MemoryLocation &LocA,
         (-ASizeInt).uge(SE.getUnsignedRange(AB).getUnsignedMax()))
       return AliasResult::NoAlias;
   }
+
+  return AliasResult::MayAlias;
+}
+
+AliasResult SCEVAAResult::alias(const MemoryLocation &LocA,
+                                const MemoryLocation &LocB, AAQueryInfo &AAQI,
+                                const Instruction *) {
+  AliasResult Result = aliasBasedOnScalarEvolution(SE, LocA, LocB);
+  if (Result != AliasResult::MayAlias)
+    return Result;
+
+  const SCEV *AS = SE.getSCEV(const_cast<Value *>(LocA.Ptr));
+  const SCEV *BS = SE.getSCEV(const_cast<Value *>(LocB.Ptr));
 
   // If ScalarEvolution can find an underlying object, form a new query.
   // The correctness of this depends on ScalarEvolution not recognizing

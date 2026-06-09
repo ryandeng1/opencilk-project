@@ -8326,9 +8326,11 @@ void LoopVectorizationPlanner::buildVPlansWithVPRecipes(ElementCount MinVF,
   LoopVersioning LVer(*LAI, LAI->getRuntimePointerChecking()->getChecks(),
                       OrigLoop, LI, DT, PSE.getSE());
   if (!LAI->getRuntimePointerChecking()->getChecks().empty() &&
-      !LAI->getRuntimePointerChecking()->getDiffChecks()) {
+      (!LAI->getRuntimePointerChecking()->getDiffChecks() ||
+       LAI->getRuntimePointerChecking()->diffChecksImplyNoAlias())) {
     // Only use noalias metadata when using memory checks guaranteeing no
-    // overlap across all iterations.
+    // overlap across all iterations.  Standard diff checks do not provide that
+    // guarantee, but DRF equality checks do.
     LVer.prepareNoAliasMetadata();
   }
 

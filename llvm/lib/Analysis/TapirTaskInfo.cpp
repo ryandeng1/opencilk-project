@@ -1415,8 +1415,10 @@ bool MaybeParallelTasks::evaluate(const Spindle *S, unsigned EvalNum) {
     const BasicBlock *Inc = PredEdge.second;
 
     // If the incoming edge is a sync edge, get the associated sync region.
+    const Instruction *IncTerm = Inc ? Inc->getTerminator() : nullptr;
+
     const Value *SyncRegSynced = nullptr;
-    if (const SyncInst *SI = dyn_cast<SyncInst>(Inc->getTerminator()))
+    if (const SyncInst *SI = dyn_cast_or_null<SyncInst>(IncTerm))
       SyncRegSynced = SI->getSyncRegion();
 
     // Iterate through the tasks in the task list for Pred.
@@ -1440,18 +1442,479 @@ bool MaybeParallelTasks::evaluate(const Spindle *S, unsigned EvalNum) {
   return NoChange;
 }
 
+using LogicalTaskSetTy = SmallPtrSet<const Task *, 2>;
+
+static void addTasksFromMap(const MPTaskListTy &Map, const Spindle *S,
+                            LogicalTaskSetTy &Out) {
+  auto It = Map.find(S);
+  if (It == Map.end())
+    return;
+  for (const Task *T : It->second)
+    Out.insert(T);
+}
+
+static bool taskSetsEqual(const LogicalTaskSetTy &LHS,
+                          const LogicalTaskSetTy &RHS) {
+  if (LHS.size() != RHS.size())
+    return false;
+  for (const Task *T : LHS)
+    if (!RHS.count(T))
+      return false;
+  return true;
+}
+
+static void replaceTaskSet(LogicalTaskSetTy &Dst,
+                           const LogicalTaskSetTy &Src) {
+  Dst.clear();
+  for (const Task *T : Src)
+    Dst.insert(T);
+}
+
+static void intersectTaskSets(LogicalTaskSetTy &LHS,
+                              const LogicalTaskSetTy &RHS) {
+  SmallVector<const Task *, 4> ToRemove;
+  for (const Task *T : LHS)
+    if (!RHS.count(T))
+      ToRemove.push_back(T);
+  for (const Task *T : ToRemove)
+    LHS.erase(T);
+}
+
+static void unionTaskSets(LogicalTaskSetTy &LHS,
+                          const LogicalTaskSetTy &RHS) {
+  for (const Task *T : RHS)
+    LHS.insert(T);
+}
+
+static void removeSyncedTasks(LogicalTaskSetTy &Set,
+                              const Value *SyncRegSynced) {
+  if (!SyncRegSynced)
+    return;
+
+  SmallVector<const Task *, 4> ToRemove;
+  for (const Task *T : Set) {
+    const DetachInst *DI = T->getDetach();
+    if (DI && SyncRegSynced == DI->getSyncRegion())
+      ToRemove.push_back(T);
+  }
+  for (const Task *T : ToRemove)
+    Set.erase(T);
+}
+
+static void collectContinuationTasks(const Spindle *S,
+                                     LogicalTaskSetTy &ContinuationTasks) {
+  if (!S->isTaskContinuation())
+    return;
+
+  for (const Spindle *Pred : predecessors(S))
+    if (S->predInDifferentTask(Pred))
+      ContinuationTasks.insert(Pred->getParentTask());
+}
+
+static const Task *getTapirLoopCarriedTaskForEdge(const Spindle *S,
+                                                  const BasicBlock *Inc) {
+  const BasicBlock *Header = S->getEntry();
+  const DetachInst *DI = dyn_cast<DetachInst>(Header->getTerminator());
+  if (!DI || Inc != DI->getContinue())
+    return nullptr;
+
+  bool IsBackedge = false;
+  for (const BasicBlock *Succ : successors(Inc))
+    if (Succ == Header) {
+      IsBackedge = true;
+      break;
+    }
+  if (!IsBackedge)
+    return nullptr;
+
+  for (const Spindle::SpindleEdge &OutEdge : S->out_edges()) {
+    if (OutEdge.second != Header)
+      continue;
+    const Spindle *Succ = OutEdge.first;
+    if (!Succ->contains(DI->getDetached()))
+      continue;
+
+    const Task *DetachedTask = Succ->getParentTask();
+    if (DetachedTask && !DetachedTask->isRootTask() &&
+        DetachedTask->getDetach() == DI)
+      return DetachedTask;
+  }
+
+  return nullptr;
+}
+
+static void computeLogicalParallelTasksForSpindle(
+    LogicalParallelTasks &LPT, const Spindle *S, LogicalTaskSetTy &NewDefinite,
+    LogicalTaskSetTy &NewMaybe, LogicalTaskSetTy &NewLoopCarried) {
+  LogicalTaskSetTy ContinuationTasks;
+  collectContinuationTasks(S, ContinuationTasks);
+
+  LogicalTaskSetTy PresentOnSomePred;
+  bool SawOrdinaryPred = false;
+
+  for (const Spindle::SpindleEdge &PredEdge : S->in_edges()) {
+    const Spindle *Pred = PredEdge.first;
+    const BasicBlock *Inc = PredEdge.second;
+
+    // Reattach edges identify the spawned task but are not ordinary
+    // parent-side control-flow alternatives for the continuation.
+    if (S->predInDifferentTask(Pred))
+      continue;
+
+    LogicalTaskSetTy EdgeDefinite;
+    LogicalTaskSetTy EdgeMaybe;
+    LogicalTaskSetTy EdgeLoopCarried;
+    addTasksFromMap(LPT.DefiniteTaskList, Pred, EdgeDefinite);
+    addTasksFromMap(LPT.MaybeTaskList, Pred, EdgeMaybe);
+    addTasksFromMap(LPT.LoopCarriedTaskList, Pred, EdgeLoopCarried);
+
+    const Instruction *IncTerm = Inc ? Inc->getTerminator() : nullptr;
+    const Task *LoopCarriedTask =
+        Inc ? getTapirLoopCarriedTaskForEdge(S, Inc) : nullptr;
+    // Do not let an uninitialized cyclic input erase definite facts from the
+    // preheader. Once the backedge predecessor has been evaluated, it must
+    // participate in the meet so syncs inside the loop can kill facts.
+    const bool SkipDefiniteMeet = LoopCarriedTask && !LPT.hasEvaluated(Pred);
+
+    const Value *SyncRegSynced = nullptr;
+    if (const SyncInst *SI = dyn_cast_or_null<SyncInst>(IncTerm))
+      SyncRegSynced = SI->getSyncRegion();
+    removeSyncedTasks(EdgeDefinite, SyncRegSynced);
+    removeSyncedTasks(EdgeMaybe, SyncRegSynced);
+    removeSyncedTasks(EdgeLoopCarried, SyncRegSynced);
+
+    if (const DetachInst *DI = dyn_cast_or_null<DetachInst>(IncTerm))
+      if (DI->getContinue() == S->getEntry())
+        for (const Task *T : ContinuationTasks)
+          if (T->getDetach() == DI)
+            EdgeDefinite.insert(T);
+
+    if (LoopCarriedTask)
+      EdgeLoopCarried.insert(LoopCarriedTask);
+
+    LogicalTaskSetTy EdgePresent;
+    for (const Task *T : EdgeDefinite)
+      EdgePresent.insert(T);
+    for (const Task *T : EdgeMaybe)
+      EdgePresent.insert(T);
+
+    for (const Task *T : EdgePresent)
+      PresentOnSomePred.insert(T);
+    unionTaskSets(NewLoopCarried, EdgeLoopCarried);
+
+    if (SkipDefiniteMeet) {
+      LLVM_DEBUG(dbgs() << "  Skipping unevaluated Tapir-loop backedge "
+                        << Pred->getEntry()->getName() << " -> "
+                        << S->getEntry()->getName()
+                        << " in definite logical-parallel meet\n");
+    } else if (!SawOrdinaryPred) {
+      replaceTaskSet(NewDefinite, EdgeDefinite);
+      SawOrdinaryPred = true;
+    } else {
+      intersectTaskSets(NewDefinite, EdgeDefinite);
+    }
+  }
+
+  for (const Task *T : PresentOnSomePred)
+    if (!NewDefinite.count(T))
+      NewMaybe.insert(T);
+}
+
+static bool updateLogicalParallelTasks(LogicalParallelTasks &LPT,
+                                       const Spindle *S,
+                                       const LogicalTaskSetTy &NewDefinite,
+                                       const LogicalTaskSetTy &NewMaybe,
+                                       const LogicalTaskSetTy &NewLoopCarried) {
+  LogicalTaskSetTy &OldDefinite = LPT.DefiniteTaskList[S];
+  LogicalTaskSetTy &OldMaybe = LPT.MaybeTaskList[S];
+  LogicalTaskSetTy &OldLoopCarried = LPT.LoopCarriedTaskList[S];
+  bool Changed = !taskSetsEqual(OldDefinite, NewDefinite) ||
+                 !taskSetsEqual(OldMaybe, NewMaybe) ||
+                 !taskSetsEqual(OldLoopCarried, NewLoopCarried);
+  if (Changed) {
+    replaceTaskSet(OldDefinite, NewDefinite);
+    replaceTaskSet(OldMaybe, NewMaybe);
+    replaceTaskSet(OldLoopCarried, NewLoopCarried);
+  }
+  return Changed;
+}
+
+bool LogicalParallelTasks::markDefiningSpindle(const Spindle *S) {
+  LLVM_DEBUG(dbgs() << "LogicalParallelTasks::markDefiningSpindle @ "
+                    << S->getEntry()->getName() << "\n");
+
+  // Seed the definite (must) component for a greatest-fixpoint evaluation: a
+  // spindle that has at least one ordinary (same-task) predecessor starts at
+  // the universe of tasks (top) and is narrowed by intersection as the worklist
+  // runs; a boundary spindle (no ordinary predecessors -- the function entry or
+  // a task entry, whose only in-edges are reattach edges) starts empty.  This
+  // recovers loop-invariant definite facts that a least-fixpoint-from-empty
+  // would lose across loop backedges, while still honoring syncs carried on the
+  // backedge (they shrink the predecessor's set).  The maybe and loop-carried
+  // (existential) components start empty and grow by union.
+  bool HasOrdinaryPred = false;
+  for (const Spindle::SpindleEdge &PredEdge : S->in_edges())
+    if (!S->predInDifferentTask(PredEdge.first)) {
+      HasOrdinaryPred = true;
+      break;
+    }
+  if (HasOrdinaryPred)
+    DefiniteTaskList[S].insert(Universe.begin(), Universe.end());
+  else
+    DefiniteTaskList.try_emplace(S);
+  MaybeTaskList.try_emplace(S);
+  LoopCarriedTaskList.try_emplace(S);
+
+  // Kick off worklist propagation from spindles that originate
+  // definite/parallel information; the actual transfer runs in evaluate() once
+  // every spindle has been seeded.
+  switch (S->getType()) {
+  case Spindle::SPType::Entry:
+  case Spindle::SPType::Detach:
+    return true;
+  case Spindle::SPType::Phi:
+    return S->isTaskContinuation();
+  case Spindle::SPType::Sync:
+    return false;
+  }
+  return false;
+}
+
+bool LogicalParallelTasks::evaluate(const Spindle *S, unsigned EvalNum) {
+  LLVM_DEBUG(dbgs() << "LogicalParallelTasks::evaluate @ "
+                    << S->getEntry()->getName() << "\n");
+  DefiniteTaskList.try_emplace(S);
+  MaybeTaskList.try_emplace(S);
+  LoopCarriedTaskList.try_emplace(S);
+
+  LogicalTaskSetTy NewDefinite;
+  LogicalTaskSetTy NewMaybe;
+  LogicalTaskSetTy NewLoopCarried;
+  computeLogicalParallelTasksForSpindle(*this, S, NewDefinite, NewMaybe,
+                                        NewLoopCarried);
+  bool Changed = updateLogicalParallelTasks(*this, S, NewDefinite, NewMaybe,
+                                            NewLoopCarried);
+  const bool FirstEval = EvaluatedSpindles.insert(S).second;
+
+  LLVM_DEBUG({
+    dbgs() << "  New LPT definite list for " << S->getEntry()->getName()
+           << (Changed ? " (changed)\n" : " (unchanged)\n");
+    for (const Task *T : DefiniteTaskList[S])
+      dbgs() << "    " << T->getEntry()->getName() << "\n";
+    dbgs() << "  New LPT maybe list for " << S->getEntry()->getName()
+           << (Changed ? " (changed)\n" : " (unchanged)\n");
+    for (const Task *T : MaybeTaskList[S])
+      dbgs() << "    " << T->getEntry()->getName() << "\n";
+    dbgs() << "  New LPT loop-carried list for "
+           << S->getEntry()->getName()
+           << (Changed ? " (changed)\n" : " (unchanged)\n");
+    for (const Task *T : LoopCarriedTaskList[S])
+      dbgs() << "    " << T->getEntry()->getName() << "\n";
+  });
+
+  return !(Changed || FirstEval);
+}
+
 raw_ostream &llvm::operator<<(raw_ostream &OS, const Spindle &S) {
   S.print(OS);
   return OS;
 }
 
+// Collect all (non-root) tasks in the function rooted at \p T.  This set is the
+// top (universe) element used to seed the definite component for a
+// greatest-fixpoint evaluation.
+static void collectAllTasks(const Task *T, SmallPtrSetImpl<const Task *> &Out) {
+  for (const Task *Sub : T->subtasks()) {
+    Out.insert(Sub);
+    collectAllTasks(Sub, Out);
+  }
+}
+
+bool TaskInfo::isDefinitelyLogicallyParallel(const BasicBlock *B1,
+                                             const BasicBlock *B2) const {
+  // Common case: No blocks execute in parallel in a serial function.
+  if (isSerial())
+    return false;
+  if (!B1 || !B2 || B1->getParent() != B2->getParent())
+    return false;
+  const DominatorTree &DT = getRootTask()->DomTree;
+  if (!DT.getRoot() || DT.getRoot()->getParent() != B1->getParent())
+    return false;
+  // Unreachable blocks cannot run in parallel.
+  if (!DT.isReachableFromEntry(B1) || !DT.isReachableFromEntry(B2))
+    return false;
+
+  // If necessary, compute which tasks are definitely logically parallel.
+  if (!LPTasks) {
+    LPTasks.reset(new LogicalParallelTasks());
+    collectAllTasks(getRootTask(), LPTasks->Universe);
+    evaluateParallelState<LogicalParallelTasks>(*LPTasks);
+  }
+
+  // Get the task Encl that encloses both basic blocks.
+  const Task *Encl = getEnclosingTask(B1, B2);
+  if (!Encl || !Encl->encloses(B1) || !Encl->encloses(B2))
+    return false;
+
+  // For each basic block, get the representative subtask of Encl that encloses
+  // that basic block.
+  const Task *B1Task = Encl->getSubTaskEnclosing(B1);
+  const Task *B2Task = Encl->getSubTaskEnclosing(B2);
+
+  // Translate these representative tasks into spindles.
+  const Spindle *B1Spindle = getSpindleFor(B1);
+  const Spindle *B2Spindle = getSpindleFor(B2);
+  if (B1Task != Encl)
+    B1Spindle = getSpindleFor(B1Task->getDetach()->getParent());
+  if (B2Task != Encl)
+    B2Spindle = getSpindleFor(B2Task->getDetach()->getParent());
+
+  return LPTasks->isDefinitelyParallelWith(B1Spindle, B2Task) ||
+         LPTasks->isDefinitelyParallelWith(B2Spindle, B1Task);
+}
+
+bool TaskInfo::isLoopCarriedLogicallyParallel(const BasicBlock *B1,
+                                              const BasicBlock *B2) const {
+  // Common case: No blocks execute in parallel in a serial function.
+  if (isSerial())
+    return false;
+  if (!B1 || !B2 || B1->getParent() != B2->getParent())
+    return false;
+  const DominatorTree &DT = getRootTask()->DomTree;
+  if (!DT.getRoot() || DT.getRoot()->getParent() != B1->getParent())
+    return false;
+  // Unreachable blocks cannot run in parallel.
+  if (!DT.isReachableFromEntry(B1) || !DT.isReachableFromEntry(B2))
+    return false;
+
+  // If necessary, compute logical-parallel state, including loop-carried
+  // Tapir-loop parallelism.
+  if (!LPTasks) {
+    LPTasks.reset(new LogicalParallelTasks());
+    collectAllTasks(getRootTask(), LPTasks->Universe);
+    evaluateParallelState<LogicalParallelTasks>(*LPTasks);
+  }
+
+  // Loop-carried logical parallelism models a detached Tapir-loop body
+  // task that is outstanding on a latch-to-header path.  Use the same
+  // representative tasks and spindles as the definite logical-parallel query,
+  // but consult the backedge-only state.
+  const Task *Encl = getEnclosingTask(B1, B2);
+  if (!Encl || !Encl->encloses(B1) || !Encl->encloses(B2))
+    return false;
+
+  const Task *B1Task = Encl->getSubTaskEnclosing(B1);
+  const Task *B2Task = Encl->getSubTaskEnclosing(B2);
+
+  const Spindle *B1Spindle = getSpindleFor(B1);
+  const Spindle *B2Spindle = getSpindleFor(B2);
+  if (B1Task != Encl)
+    B1Spindle = getSpindleFor(B1Task->getDetach()->getParent());
+  if (B2Task != Encl)
+    B2Spindle = getSpindleFor(B2Task->getDetach()->getParent());
+
+  if (LPTasks->isLoopCarriedParallelWith(B1Spindle, B2Task) ||
+      LPTasks->isLoopCarriedParallelWith(B2Spindle, B1Task))
+    return true;
+
+  // Same-task self-parallelism: two accesses in the body of a Tapir loop are
+  // logically parallel across distinct loop iterations.  When both blocks
+  // reduce to the enclosing task itself and that task is a detached Tapir-loop
+  // body, it is recorded as loop-carried parallel at its own detach (the
+  // Tapir-loop header), so consult that entry directly.  Same-iteration
+  // aliasing is resolved downstream (e.g. via ScalarEvolution), so reporting
+  // cross-iteration parallelism here is safe.
+  if (B1Task == Encl && B2Task == Encl && !Encl->isRootTask()) {
+    if (const DetachInst *DI = Encl->getDetach()) {
+      const Spindle *HeaderSpindle = getSpindleFor(DI->getParent());
+      if (HeaderSpindle &&
+          LPTasks->isLoopCarriedParallelWith(HeaderSpindle, Encl))
+        return true;
+    }
+  }
+
+  return false;
+}
+
+bool TaskInfo::isLoopCarriedLogicallyParallelViaLoop(
+    const BasicBlock *B1, const BasicBlock *B2, const Loop *L) const {
+  // Common case: No blocks execute in parallel in a serial function.
+  if (isSerial())
+    return false;
+  if (!B1 || !B2 || B1->getParent() != B2->getParent())
+    return false;
+  if (!L || !L->getHeader() || L->getHeader()->getParent() != B1->getParent())
+    return false;
+  if (!L->contains(B1) || !L->contains(B2))
+    return false;
+
+  const DominatorTree &DT = getRootTask()->DomTree;
+  if (!DT.getRoot() || DT.getRoot()->getParent() != B1->getParent())
+    return false;
+  // Unreachable blocks cannot run in parallel.
+  if (!DT.isReachableFromEntry(B1) || !DT.isReachableFromEntry(B2) ||
+      !DT.isReachableFromEntry(L->getHeader()))
+    return false;
+
+  const auto *DI = dyn_cast<DetachInst>(L->getHeader()->getTerminator());
+  if (!DI)
+    return false;
+
+  // If necessary, compute logical-parallel state, including loop-carried
+  // Tapir-loop parallelism.
+  if (!LPTasks) {
+    LPTasks.reset(new LogicalParallelTasks());
+    collectAllTasks(getRootTask(), LPTasks->Universe);
+    evaluateParallelState<LogicalParallelTasks>(*LPTasks);
+  }
+
+  const Spindle *HeaderSpindle = getSpindleFor(L->getHeader());
+  const Task *LoopBodyTask = getTaskFor(DI->getDetached());
+  if (!HeaderSpindle || !LoopBodyTask || LoopBodyTask->isRootTask() ||
+      LoopBodyTask->getDetach() != DI)
+    return false;
+
+  // Key the proof to this loop header specifically.  The loop-carried dataflow
+  // records the detached loop-body task at the header spindle only when the
+  // candidate edge is the Tapir loop continuation backedge.
+  if (!LPTasks->isLoopCarriedParallelWith(HeaderSpindle, LoopBodyTask))
+    return false;
+
+  // Same static loop-body task, different dynamic iterations.  This is the
+  // identity that the unkeyed query loses once the caller has a particular
+  // LoopInfo loop in hand.
+  if (LoopBodyTask->encloses(B1) && LoopBodyTask->encloses(B2))
+    return true;
+
+  // Also handle queries that reduce one side to the loop header spindle and the
+  // other side to the body task for this exact loop.
+  const Task *Encl = getEnclosingTask(B1, B2);
+  if (!Encl || !Encl->encloses(B1) || !Encl->encloses(B2))
+    return false;
+
+  const Task *B1Task = Encl->getSubTaskEnclosing(B1);
+  const Task *B2Task = Encl->getSubTaskEnclosing(B2);
+
+  const Spindle *B1Spindle = getSpindleFor(B1);
+  const Spindle *B2Spindle = getSpindleFor(B2);
+  if (B1Task != Encl)
+    B1Spindle = getSpindleFor(B1Task->getDetach()->getParent());
+  if (B2Task != Encl)
+    B2Spindle = getSpindleFor(B2Task->getDetach()->getParent());
+
+  return (B1Spindle == HeaderSpindle && B2Task == LoopBodyTask) ||
+         (B2Spindle == HeaderSpindle && B1Task == LoopBodyTask);
+}
+
 bool TaskInfo::invalidate(Function &F, const PreservedAnalyses &PA,
-                          FunctionAnalysisManager::Invalidator &) {
-  // Check whether the analysis, all analyses on functions, or the function's
-  // CFG have been preserved.
+                          FunctionAnalysisManager::Invalidator &Inv) {
+  if (Inv.invalidate<DominatorTreeAnalysis>(F, PA))
+    return true;
+
+  // TaskInfo owns task-structure maps and keeps references to analyses used
+  // while building them. Keep it only when explicitly preserved.
   auto PAC = PA.getChecker<TaskAnalysis>();
-  return !(PAC.preserved() || PAC.preservedSet<AllAnalysesOn<Function>>() ||
-           PAC.preservedSet<CFGAnalyses>());
+  return !(PAC.preserved() || PAC.preservedSet<AllAnalysesOn<Function>>());
 }
 
 /// Print spindle with all the BBs inside it.

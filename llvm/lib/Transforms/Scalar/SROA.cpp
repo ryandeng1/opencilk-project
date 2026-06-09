@@ -4220,12 +4220,9 @@ private:
                                     Phi->getName() + ".sroa.phi");
 
     Type *SourceTy = GEPI.getSourceElementType();
-    // We only handle arguments, constants, and static allocas here, so we can
-    // insert GEPs at the end of the entry block of the task that contains both
-    // the GEP and the Phi.  Because the GEP uses the Phi, we use the Phi
-    // to determine which task contains both.
-    IRB.SetInsertPoint(
-        TI->getTaskFor(Phi->getParent())->getEntry()->getTerminator());
+    // Create each incoming GEP in its corresponding predecessor block so the
+    // value dominates the replacement PHI even when the use is inside a
+    // detached task.
     for (unsigned I = 0, E = Phi->getNumIncomingValues(); I != E; ++I) {
       Value *Op = Phi->getIncomingValue(I);
       BasicBlock *BB = Phi->getIncomingBlock(I);
@@ -4234,6 +4231,7 @@ private:
         NewGEP = NewPhi->getIncomingValue(NI);
       } else {
         SmallVector<Value *> NewOps = GetNewOps(Op);
+        IRB.SetInsertPoint(BB->getTerminator());
         NewGEP =
             IRB.CreateGEP(SourceTy, NewOps[0], ArrayRef(NewOps).drop_front(),
                           Phi->getName() + ".sroa.gep", GEPI.getNoWrapFlags());

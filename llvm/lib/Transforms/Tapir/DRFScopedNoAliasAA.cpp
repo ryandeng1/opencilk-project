@@ -13,11 +13,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Tapir/DRFScopedNoAliasAA.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
+#include "llvm/Analysis/DataRaceFreeAliasAnalysis.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/MemoryLocation.h"
+#include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TapirTaskInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Instruction.h"
@@ -28,25 +32,49 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Tapir.h"
+#include <memory>
 
 #define DEBUG_TYPE "drf-scoped-noalias"
 
 using namespace llvm;
 
+static cl::opt<bool> EnableDRFAAProvenPairMetadata(
+    "enable-drf-aa-proven-pair-metadata", cl::init(true), cl::Hidden,
+    cl::desc("Materialize pair-specific scoped-noalias metadata for "
+             "DRFAA-proven memory access pairs (default = on)"));
+
+static cl::opt<unsigned> MaxDRFAAProvenPairAccessesPerTask(
+    "drf-aa-proven-pair-max-accesses-per-task", cl::init(512), cl::Hidden,
+    cl::desc("Maximum simple memory accesses to inspect per Tapir task when "
+             "materializing DRFAA-proven pair metadata"));
+
+static cl::opt<unsigned> MaxDRFAAProvenPairChecksPerTask(
+    "drf-aa-proven-pair-max-checks-per-task", cl::init(65536), cl::Hidden,
+    cl::desc("Maximum access pairs to inspect per Tapir task when "
+             "materializing DRFAA-proven pair metadata"));
+
 /// Process Tapir loops within the given function for loop spawning.
 class DRFScopedNoAliasImpl {
 public:
   DRFScopedNoAliasImpl(Function &F, TaskInfo &TI, AliasAnalysis &AA,
-                       LoopInfo *LI)
-      : F(F), TI(TI), LI(LI) {
+                       LoopInfo *LI, ScalarEvolution &SE)
+      : F(F), TI(TI), LI(LI), SE(SE),
+        DeltaSetProofCache(createDRFAADeltaSetProofCache()) {
+    (void)AA;
     TI.evaluateParallelState<MaybeParallelTasks>(MPTasks);
+  }
+
+  ~DRFScopedNoAliasImpl() {
+    destroyDRFAADeltaSetProofCache(DeltaSetProofCache);
   }
 
   bool run();
 
 private:
   bool populateTaskScopeNoAlias();
+  bool populateProvenPairNoAlias();
 
   bool populateSubTaskScopeNoAlias(
       const Task *T, MDBuilder &MDB, SmallVectorImpl<Metadata *> &CurrScopes,
@@ -61,6 +89,8 @@ private:
   Function &F;
   TaskInfo &TI;
   LoopInfo *LI;
+  ScalarEvolution &SE;
+  DRFAADeltaSetProofCache *DeltaSetProofCache = nullptr;
 
   MaybeParallelTasks MPTasks;
 };
@@ -81,6 +111,8 @@ struct DRFScopedNoAliasWrapperPass : public FunctionPass {
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<LoopInfoWrapperPass>();
     AU.addPreserved<LoopInfoWrapperPass>();
+    AU.addRequired<ScalarEvolutionWrapperPass>();
+    AU.addPreserved<ScalarEvolutionWrapperPass>();
     AU.addRequired<TaskInfoWrapperPass>();
     AU.addPreserved<TaskInfoWrapperPass>();
     AU.addRequired<AAResultsWrapperPass>();
@@ -96,6 +128,7 @@ INITIALIZE_PASS_BEGIN(DRFScopedNoAliasWrapperPass, "drf-scoped-noalias",
                       false, false)
 INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(TaskInfoWrapperPass)
 INITIALIZE_PASS_END(DRFScopedNoAliasWrapperPass, "drf-scoped-noalias",
                     "Add DRF-based scoped-noalias metadata",
@@ -292,8 +325,124 @@ bool DRFScopedNoAliasImpl::populateTaskScopeNoAlias() {
                                      TaskToScope);
 }
 
+static bool isSimplePairMetadataCandidate(const Instruction &I) {
+  if (const auto *LI = dyn_cast<LoadInst>(&I))
+    return !LI->isAtomic();
+  if (const auto *SI = dyn_cast<StoreInst>(&I))
+    return !SI->isAtomic();
+  return false;
+}
+
+static bool simpleAccessMayRace(const Instruction &I) {
+  // The candidate filter excludes atomics; for loads/stores only non-atomic
+  // stores can witness a data race.
+  return isa<StoreInst>(&I);
+}
+
+static MemoryLocation getSimpleAccessLocation(const Instruction *I) {
+  if (const auto *LI = dyn_cast<LoadInst>(I))
+    return MemoryLocation::get(LI);
+  return MemoryLocation::get(cast<StoreInst>(I));
+}
+
+static void appendScopedMetadata(Instruction &I, unsigned Kind, MDNode *Scope) {
+  Metadata *MDs[] = {Scope};
+  MDNode *NewMD = MDNode::get(I.getContext(), MDs);
+  I.setMetadata(Kind, MDNode::concatenate(I.getMetadata(Kind), NewMD));
+}
+
+static void attachPairScopedNoAlias(Instruction &A, Instruction &B,
+                                    MDNode *ScopeA, MDNode *ScopeB) {
+  appendScopedMetadata(A, LLVMContext::MD_alias_scope, ScopeA);
+  appendScopedMetadata(A, LLVMContext::MD_noalias, ScopeB);
+  appendScopedMetadata(B, LLVMContext::MD_alias_scope, ScopeB);
+  appendScopedMetadata(B, LLVMContext::MD_noalias, ScopeA);
+}
+
+bool DRFScopedNoAliasImpl::populateProvenPairNoAlias() {
+  if (!EnableDRFAAProvenPairMetadata || TI.isSerial())
+    return false;
+
+  LLVMContext &Ctx = F.getContext();
+  const unsigned DoneKind = Ctx.getMDKindID("drfaa.proven.pair.noalias.done");
+  if (F.getMetadata(DoneKind))
+    return false;
+
+  DenseMap<const Task *, SmallVector<Instruction *, 32>> AccessesByTask;
+  for (BasicBlock &BB : F) {
+    const Task *T = TI.getTaskFor(&BB);
+    if (!T)
+      continue;
+
+    for (Instruction &I : BB)
+      if (isSimplePairMetadataCandidate(I))
+        AccessesByTask[T].push_back(&I);
+  }
+
+  bool Changed = false;
+  unsigned PairID = 0;
+  MDBuilder MDB(Ctx);
+  MDNode *Domain = MDB.createAnonymousAliasScopeDomain(
+      ("drfaa_pairdom_" + F.getName()).str());
+
+  for (auto &Entry : AccessesByTask) {
+    SmallVectorImpl<Instruction *> &Accesses = Entry.second;
+    const unsigned NumAccesses = Accesses.size();
+    if (NumAccesses < 2)
+      continue;
+
+    if (NumAccesses > MaxDRFAAProvenPairAccessesPerTask) {
+      LLVM_DEBUG(dbgs() << "DRFScopedNoAlias: skipping task with "
+                        << NumAccesses << " memory accesses in "
+                        << F.getName() << "\n");
+      continue;
+    }
+
+    const uint64_t NumPairs =
+        (uint64_t)NumAccesses * (uint64_t)(NumAccesses - 1) / 2;
+    if (NumPairs > MaxDRFAAProvenPairChecksPerTask) {
+      LLVM_DEBUG(dbgs() << "DRFScopedNoAlias: skipping task with "
+                        << NumPairs << " access pairs in " << F.getName()
+                        << "\n");
+      continue;
+    }
+
+    for (unsigned I = 0; I != NumAccesses; ++I) {
+      Instruction *A = Accesses[I];
+      for (unsigned J = I + 1; J != NumAccesses; ++J) {
+        Instruction *B = Accesses[J];
+        if (!simpleAccessMayRace(*A) && !simpleAccessMayRace(*B))
+          continue;
+
+        MemoryLocation LocA = getSimpleAccessLocation(A);
+        MemoryLocation LocB = getSimpleAccessLocation(B);
+        if (!drfAliasWouldImplyParallelRace(TI, LocA, LocB, A, B, SE,
+                                             DeltaSetProofCache))
+          continue;
+
+        const std::string Name = ("drfaa_pair_" + Twine(PairID++)).str();
+        MDNode *ScopeA = MDB.createAnonymousAliasScope(Domain, Name + ".a");
+        MDNode *ScopeB = MDB.createAnonymousAliasScope(Domain, Name + ".b");
+        attachPairScopedNoAlias(*A, *B, ScopeA, ScopeB);
+        Changed = true;
+
+        LLVM_DEBUG(dbgs() << "DRFScopedNoAlias: materialized pair noalias\n"
+                          << "  A: " << *A << "\n"
+                          << "  B: " << *B << "\n");
+      }
+    }
+  }
+
+  if (Changed)
+    F.setMetadata(DoneKind, MDNode::get(Ctx, {}));
+
+  return Changed;
+}
+
 bool DRFScopedNoAliasImpl::run() {
-  return populateTaskScopeNoAlias();
+  bool Changed = populateTaskScopeNoAlias();
+  Changed |= populateProvenPairNoAlias();
+  return Changed;
 }
 
 bool DRFScopedNoAliasWrapperPass::runOnFunction(Function &F) {
@@ -303,7 +452,8 @@ bool DRFScopedNoAliasWrapperPass::runOnFunction(Function &F) {
   TaskInfo &TI = getAnalysis<TaskInfoWrapperPass>().getTaskInfo();
   AliasAnalysis &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
   LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-  return DRFScopedNoAliasImpl(F, TI, AA, &LI).run();
+  ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+  return DRFScopedNoAliasImpl(F, TI, AA, &LI, SE).run();
 }
 
 // createDRFScopedNoAliasPass - Provide an entry point to create this pass.
@@ -319,11 +469,13 @@ PreservedAnalyses DRFScopedNoAliasPass::run(Function &F,
   TaskInfo &TI = AM.getResult<TaskAnalysis>(F);
   AliasAnalysis &AA = AM.getResult<AAManager>(F);
   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
+  ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
 
-  DRFScopedNoAliasImpl(F, TI, AA, &LI).run();
+  DRFScopedNoAliasImpl(F, TI, AA, &LI, SE).run();
 
   PreservedAnalyses PA;
   PA.preserve<LoopAnalysis>();
+  PA.preserve<ScalarEvolutionAnalysis>();
   PA.preserve<TaskAnalysis>();
   PA.preserve<DominatorTreeAnalysis>();
   return PA;

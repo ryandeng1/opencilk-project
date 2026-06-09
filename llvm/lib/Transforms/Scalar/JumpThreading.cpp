@@ -313,6 +313,12 @@ bool JumpThreadingPass::runImpl(Function &F_, FunctionAnalysisManager *FAM_,
   assert(DTU->hasDomTree() && "JumpThreading relies on DomTree to proceed.");
   DominatorTree &DT = DTU->getDomTree();
 
+  bool EverChanged = removeUnreachableBlocks(*F, DTU.get());
+  if (EverChanged) {
+    ChangedSinceLastAnalysisUpdate = true;
+    DTU->flush();
+  }
+
   Unreachable.clear();
   for (auto &BB : *F)
     if (!DT.isReachableFromEntry(&BB))
@@ -323,7 +329,6 @@ bool JumpThreadingPass::runImpl(Function &F_, FunctionAnalysisManager *FAM_,
 
   findTapirTasks(*F, DT);
 
-  bool EverChanged = false;
   bool Changed;
   do {
     Changed = false;
@@ -562,6 +567,45 @@ void JumpThreadingPass::findTapirTasks(Function &F, DominatorTree &DT) {
             TapirTasks[&BB].insert(PredBB);
     }
   }
+}
+
+static bool hasTapirControlTerminator(const BasicBlock *BB) {
+  const Instruction *TI = BB->getTerminator();
+  return isa<DetachInst>(TI) || isa<ReattachInst>(TI) || isa<SyncInst>(TI) ||
+         isDetachedRethrow(TI);
+}
+
+static bool hasTapirControlPredecessor(const BasicBlock *BB) {
+  return any_of(predecessors(BB), [](const BasicBlock *Pred) {
+    return hasTapirControlTerminator(Pred);
+  });
+}
+
+static bool useRequiresSSARenameThroughTapir(Use &U,
+                                             const BasicBlock *DefBB) {
+  Instruction *User = dyn_cast<Instruction>(U.getUser());
+  if (!User)
+    return false;
+
+  BasicBlock *UseBB = User->getParent();
+  if (PHINode *UserPN = dyn_cast<PHINode>(User)) {
+    if (UserPN->getIncomingBlock(U) == DefBB)
+      return false;
+    UseBB = UserPN->getParent();
+  } else if (UseBB == DefBB) {
+    return false;
+  }
+
+  return hasTapirControlTerminator(UseBB) || hasTapirControlPredecessor(UseBB);
+}
+
+static bool hasTapirUnsafeSSAUpdate(BasicBlock *BB) {
+  for (Instruction &I : *BB)
+    for (Use &U : I.uses())
+      if (useRequiresSSARenameThroughTapir(U, BB))
+        return true;
+
+  return false;
 }
 
 /// getKnownConstant - Helper method to determine if we can thread over a
@@ -1254,6 +1298,11 @@ static bool isOpDefinedInBlock(Value *Op, BasicBlock *BB) {
 /// This is an important optimization that encourages jump threading, and needs
 /// to be run interlaced with other jump threading tasks.
 bool JumpThreadingPass::simplifyPartiallyRedundantLoad(LoadInst *LoadI) {
+  // Refresh AA after CFG changes. DRF-AA depends on Tapir task structure, which
+  // can become stale while JumpThreading incrementally rewrites blocks.
+  if (ChangedSinceLastAnalysisUpdate && FAM)
+    runExternalAnalysis<AAManager>();
+
   // Don't hack volatile and ordered loads.
   if (!LoadI->isUnordered()) return false;
 
@@ -2465,6 +2514,12 @@ bool JumpThreadingPass::tryThreadEdge(
           << "' to dest " << (SuccIsHeader ? "loop header BB '" : "block BB '")
           << SuccBB->getName() << "' - it might create an irreducible loop!\n";
     });
+    return false;
+  }
+
+  if (!TapirTasks.empty() && hasTapirUnsafeSSAUpdate(BB)) {
+    LLVM_DEBUG(dbgs() << "  Not threading BB '" << BB->getName()
+                      << "' - non-local SSA repair crosses Tapir control\n");
     return false;
   }
 

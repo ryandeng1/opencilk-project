@@ -267,7 +267,9 @@ bool LoopSafetyInfo::allLoopPathsLeadToBlock(const Loop *CurLoop,
 static bool isGuaranteedToExecuteInTask(const Instruction &Inst,
                                         const DominatorTree *DT,
                                         const Task *T) {
-  assert(T && T->encloses(Inst.getParent()) && "Inst is not in given task.");
+  if (!T || !T->encloses(Inst.getParent()))
+    return false;
+
   // Examine all exiting blocks of the task.
   for (const Spindle *S :
          depth_first<InTask<Spindle *>>(T->getEntrySpindle())) {
@@ -318,9 +320,11 @@ bool SimpleLoopSafetyInfo::isGuaranteedToExecute(const Instruction &Inst,
       // Check if the instruction is guaranteed to execute in its task.
       if (!isGuaranteedToExecuteInTask(*RepInst, DT, T))
         InstGuaranteedToExecuteInSubtask = false;
-      else
+      else if (const Instruction *Detach = T->getDetach())
         // Use the task's detach in place of the original instruction.
-        RepInst = T->getDetach();
+        RepInst = Detach;
+      else
+        InstGuaranteedToExecuteInSubtask = false;
     }
   }
 
@@ -358,9 +362,11 @@ bool ICFLoopSafetyInfo::isGuaranteedToExecute(const Instruction &Inst,
       // Check if the instruction is guaranteed to execute in its task.
       if (!isGuaranteedToExecuteInTask(*RepInst, DT, T))
         InstGuaranteedToExecuteInSubtask = false;
-      else
+      else if (const Instruction *Detach = T->getDetach())
         // Use the task's detach in place of the original instruction.
-        RepInst = T->getDetach();
+        RepInst = Detach;
+      else
+        InstGuaranteedToExecuteInSubtask = false;
     }
   }
 

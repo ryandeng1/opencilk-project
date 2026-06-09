@@ -133,6 +133,7 @@
 #include "llvm/Transforms/Scalar/WarnMissedTransforms.h"
 #include "llvm/Transforms/Tapir/LoopSpawningTI.h"
 #include "llvm/Transforms/Tapir/LoopStripMinePass.h"
+#include "llvm/Transforms/Tapir/DRFScopedNoAliasAA.h"
 #include "llvm/Transforms/Tapir/SerializeSmallTasks.h"
 #include "llvm/Transforms/Tapir/TapirToTarget.h"
 #include "llvm/Transforms/Utils/AddDiscriminators.h"
@@ -749,6 +750,12 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
 
   // Delete small array after loop unroll.
   FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
+
+  // Materialize DRF no-alias metadata only after inlining, loop cleanup, and
+  // SROA have exposed the relevant memory accesses, while GVN/DSE/LICM still
+  // remain to consume it.
+  if (EnableDRFAA)
+    FPM.addPass(DRFScopedNoAliasPass());
 
   // Try vectorization/scalarization transforms that are both improvements
   // themselves and can allow further folds with GVN and InstCombine.
@@ -1597,6 +1604,9 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
     OptimizePM.addPass(InstCombinePass());
   }
 
+  if (EnableDRFAA)
+    OptimizePM.addPass(DRFScopedNoAliasPass());
+
   invokeVectorizerStartEPCallbacks(OptimizePM, Level);
 
   LoopPassManager LPM;
@@ -2361,6 +2371,8 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
   }
 
   FunctionPassManager MainFPM;
+  if (EnableDRFAA)
+    MainFPM.addPass(DRFScopedNoAliasPass());
   MainFPM.addPass(createFunctionToLoopPassAdaptor(
       LICMPass(PTO.LicmMssaOptCap, PTO.LicmMssaNoAccForPromotionCap,
                /*AllowSpeculation=*/true),

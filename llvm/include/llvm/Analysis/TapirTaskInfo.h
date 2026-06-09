@@ -870,8 +870,13 @@ public:
     // DomTree.dominates(getEntry(), BB) will return true if BB is not reachable
     // and getEntry() is reachable.  This method should return that BB is not
     // simply enclosed in that case.
+    const BasicBlock *Entry = getEntry();
+    if (!BB || !Entry || Entry->getParent() != BB->getParent())
+      return false;
+    if (!DomTree.getRoot() || DomTree.getRoot()->getParent() != BB->getParent())
+      return false;
     return DomTree.isReachableFromEntry(BB) &&
-           DomTree.dominates(getEntry(), BB);
+           DomTree.dominates(Entry, BB);
   }
 
   /// Return true if specified task encloses basic block BB.
@@ -1140,6 +1145,38 @@ struct MaybeParallelTasks {
   bool evaluate(const Spindle *S, unsigned EvalNum);
 };
 
+// Structure to record child tasks that are logically parallel with each
+// spindle. Definite tasks are parallel with the spindle on every ordinary
+// parent-task path that reaches it. Maybe tasks are parallel on some, but not
+// all, such paths.
+struct LogicalParallelTasks {
+  MPTaskListTy DefiniteTaskList;
+  MPTaskListTy MaybeTaskList;
+  MPTaskListTy LoopCarriedTaskList;
+  SmallPtrSet<const Spindle *, 8> EvaluatedSpindles;
+  // The set of all tasks in the function, used as the top (universe) element
+  // when seeding the definite (must) component as a greatest fixpoint.  The
+  // caller populates this before evaluating the dataflow.
+  SmallPtrSet<const Task *, 8> Universe;
+
+  bool markDefiningSpindle(const Spindle *S);
+  bool evaluate(const Spindle *S, unsigned EvalNum);
+
+  bool hasEvaluated(const Spindle *S) const {
+    return EvaluatedSpindles.count(S);
+  }
+
+  bool isDefinitelyParallelWith(const Spindle *S, const Task *T) const {
+    auto It = DefiniteTaskList.find(S);
+    return It != DefiniteTaskList.end() && It->second.count(T);
+  }
+
+  bool isLoopCarriedParallelWith(const Spindle *S, const Task *T) const {
+    auto It = LoopCarriedTaskList.find(S);
+    return It != LoopCarriedTaskList.end() && It->second.count(T);
+  }
+};
+
 //===----------------------------------------------------------------------===//
 /// This class builds and contains all of the top-level task structures in the
 /// specified function.
@@ -1156,6 +1193,10 @@ class TaskInfo {
   // Cache storing maybe-parallel-task state.  This cache is initialized lazily
   // by calls to the mayHappenInParallel method.
   mutable std::unique_ptr<MaybeParallelTasks> MPTasks;
+
+  // Cache storing definite/maybe/backedge logical-parallel-task state.  This
+  // cache is initialized lazily by logical-parallel queries.
+  mutable std::unique_ptr<LogicalParallelTasks> LPTasks;
 
   // Flag to indicate whether the taskframe tree has been computed.
   mutable bool ComputedTaskFrameTree = false;
@@ -1179,6 +1220,7 @@ public:
         SpindleMap(std::move(Arg.SpindleMap)),
         RootTask(std::move(Arg.RootTask)),
         MPTasks(std::move(Arg.MPTasks)),
+        LPTasks(std::move(Arg.LPTasks)),
         TaskAllocator(std::move(Arg.TaskAllocator)) {
     Arg.RootTask = nullptr;
   }
@@ -1189,6 +1231,7 @@ public:
       RootTask->~Task();
     RootTask = std::move(RHS.RootTask);
     MPTasks = std::move(RHS.MPTasks);
+    LPTasks = std::move(RHS.LPTasks);
     TaskAllocator = std::move(RHS.TaskAllocator);
     RHS.RootTask = nullptr;
     return *this;
@@ -1212,6 +1255,13 @@ public:
       MPTasks->TaskList.clear();
       MPTasks.reset();
     }
+    if (LPTasks) {
+      LPTasks->DefiniteTaskList.clear();
+      LPTasks->MaybeTaskList.clear();
+      LPTasks->LoopCarriedTaskList.clear();
+      LPTasks->EvaluatedSpindles.clear();
+      LPTasks.reset();
+    }
     ComputedTaskFrameTree = false;
     TaskAllocator.Reset();
   }
@@ -1226,6 +1276,11 @@ public:
   }
 
   Task *getRootTask() const { return RootTask; }
+
+  const DominatorTree &getDominatorTree() const {
+    assert(getRootTask() && "Null root task\n");
+    return getRootTask()->DomTree;
+  }
 
   /// Return true if this function is "serial," meaning it does not itself
   /// perform a detach.  This method does not preclude functions called by this
@@ -1374,6 +1429,10 @@ public:
     // Common case: No blocks execute in parallel in a serial function.
     if (isSerial())
       return false;
+    const DominatorTree &DT = getRootTask()->DomTree;
+    // Unreachable blocks cannot run in parallel.
+    if (!DT.isReachableFromEntry(B1) || !DT.isReachableFromEntry(B2))
+      return false;
 
     // if (getTaskFor(B1) == getTaskFor(B2))
     //   return false;
@@ -1404,6 +1463,41 @@ public:
     // spindles to determine if the blocks may execute in parallel.
     return MPTasks->TaskList[B1Spindle].count(B2Task) ||
       MPTasks->TaskList[B2Spindle].count(B1Task);
+  }
+
+  /// Check if the two basic blocks are definitely logically parallel. This is a
+  /// stricter query than mayHappenInParallel: it returns true only when the
+  /// logical-parallel relationship holds on every ordinary control-flow path
+  /// represented by the queried spindles.
+  bool isDefinitelyLogicallyParallel(const BasicBlock *B1,
+                                     const BasicBlock *B2) const;
+
+  bool isDefinitelyLogicallyParallel(const Instruction *I1,
+                                     const Instruction *I2) const {
+    return isDefinitelyLogicallyParallel(I1->getParent(), I2->getParent());
+  }
+
+  /// Check if the two basic blocks are parallel due to distinct dynamic
+  /// iterations of the same Tapir loop body.
+  bool isLoopCarriedLogicallyParallel(const BasicBlock *B1,
+                                      const BasicBlock *B2) const;
+
+  bool isLoopCarriedLogicallyParallel(const Instruction *I1,
+                                      const Instruction *I2) const {
+    return isLoopCarriedLogicallyParallel(I1->getParent(), I2->getParent());
+  }
+
+  /// Check if the two basic blocks are parallel due to distinct dynamic
+  /// iterations of the specified Tapir loop.
+  bool isLoopCarriedLogicallyParallelViaLoop(const BasicBlock *B1,
+                                             const BasicBlock *B2,
+                                             const Loop *L) const;
+
+  bool isLoopCarriedLogicallyParallelViaLoop(const Instruction *I1,
+                                             const Instruction *I2,
+                                             const Loop *L) const {
+    return isLoopCarriedLogicallyParallelViaLoop(I1->getParent(),
+                                                I2->getParent(), L);
   }
 
   /// Create the task forest using a stable algorithm.
