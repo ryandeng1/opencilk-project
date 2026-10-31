@@ -79,6 +79,10 @@ static cl::opt<unsigned> UnrollAndJamThreshold(
     "unroll-and-jam-threshold", cl::init(60), cl::Hidden,
     cl::desc("Threshold to use for inner loop when doing unroll and jam."));
 
+static cl::opt<unsigned> DRFUnrollAndJamCount(
+    "drf-unroll-and-jam-count", cl::init(4), cl::Hidden,
+    cl::desc("Preferred unroll-and-jam count for DRF-parallel loop nests"));
+
 static cl::opt<unsigned> PragmaUnrollAndJamThreshold(
     "pragma-unroll-and-jam-threshold", cl::init(1024), cl::Hidden,
     cl::desc("Unrolled size limit for loops with an unroll_and_jam(full) or "
@@ -155,7 +159,7 @@ static bool computeUnrollAndJamCount(
     unsigned OuterTripMultiple, const UnrollCostEstimator &OuterUCE,
     unsigned InnerTripCount, unsigned InnerLoopSize,
     TargetTransformInfo::UnrollingPreferences &UP,
-    TargetTransformInfo::PeelingPreferences &PP) {
+    TargetTransformInfo::PeelingPreferences &PP, bool UseDRFHeuristic) {
   unsigned OuterLoopSize = OuterUCE.getRolledLoopSize();
   // First up use computeUnrollCount from the loop unroller to get a count
   // for unrolling the outer loop, plus any loops requiring explicit
@@ -235,7 +239,8 @@ static bool computeUnrollAndJamCount(
 
   // If the inner loop count is known and small, leave the entire loop nest to
   // be the unroller
-  if (InnerTripCount && InnerLoopSize * InnerTripCount < UP.Threshold) {
+  if (!UseDRFHeuristic && InnerTripCount &&
+      InnerLoopSize * InnerTripCount < UP.Threshold) {
     LLVM_DEBUG(dbgs() << "Won't unroll-and-jam; small inner loop count is "
                          "being left for the unroller\n");
     UP.Count = 0;
@@ -271,6 +276,32 @@ static bool computeUnrollAndJamCount(
     return false;
   }
 
+  // DRF can make register blocking legal on nests where ordinary DA is
+  // confused.  If the generic unroller selected no useful count, choose a
+  // small count that still respects the target's code-size limits.
+  if (UseDRFHeuristic && UP.Count <= 1) {
+    unsigned Count = std::max(2u, DRFUnrollAndJamCount.getValue());
+    if (OuterTripCount)
+      Count = std::min(Count, OuterTripCount);
+
+    while (Count > 1) {
+      UP.Count = Count;
+      bool FitsThresholds =
+          getUnrollAndJammedLoopSize(OuterLoopSize, UP) < UP.Threshold &&
+          getUnrollAndJammedLoopSize(InnerLoopSize, UP) <
+              UP.UnrollAndJamInnerLoopThreshold;
+      bool CanFormRemainder =
+          UP.AllowRemainder ||
+          (OuterTripMultiple && OuterTripMultiple % Count == 0);
+      if (FitsThresholds && CanFormRemainder)
+        break;
+      --Count;
+    }
+
+    UP.Count = Count;
+    LLVM_DEBUG(dbgs() << "Using DRF unroll-and-jam count " << UP.Count
+                      << "\n");
+  }
   return false;
 }
 
@@ -291,6 +322,12 @@ tryToUnrollAndJamLoop(Loop *L, DominatorTree &DT, LoopInfo *LI,
   if (EnableMode & TM_ForcedByUser)
     UP.UnrollAndJam = true;
 
+  bool UseDRFHeuristic = EnableDRFLoopOptimizations && DI.isDRFParallelLoop(L);
+  if (UseDRFHeuristic) {
+    UP.UnrollAndJam = true;
+    if (UP.UnrollAndJamInnerLoopThreshold == 0)
+      UP.UnrollAndJamInnerLoopThreshold = UnrollAndJamThreshold;
+  }
   if (AllowUnrollAndJam.getNumOccurrences() > 0)
     UP.UnrollAndJam = AllowUnrollAndJam;
   if (UnrollAndJamThreshold.getNumOccurrences() > 0)
@@ -370,8 +407,9 @@ tryToUnrollAndJamLoop(Loop *L, DominatorTree &DT, LoopInfo *LI,
 
   // Decide if, and by how much, to unroll
   bool IsCountSetExplicitly = computeUnrollAndJamCount(
-    L, SubLoop, TTI, DT, LI, &AC, SE, EphValues, &ORE, OuterTripCount,
-      OuterTripMultiple, OuterUCE, InnerTripCount, InnerLoopSize, UP, PP);
+      L, SubLoop, TTI, DT, LI, &AC, SE, EphValues, &ORE, OuterTripCount,
+      OuterTripMultiple, OuterUCE, InnerTripCount, InnerLoopSize, UP, PP,
+      UseDRFHeuristic);
   if (UP.Count <= 1)
     return LoopUnrollResult::Unmodified;
   // Unroll factor (Count) must be less or equal to TripCount.
@@ -457,7 +495,10 @@ PreservedAnalyses LoopUnrollAndJamPass::run(LoopNest &LN,
                                             LPMUpdater &U) {
   Function &F = *LN.getParent();
 
-  DependenceInfo DI(&F, &AR.AA, &AR.SE, &AR.LI);
+  // Preserve structural Tapir information for the shared DRF classifier.  A
+  // metadata-derived loop does not require TaskInfo, but an intact Tapir level
+  // does.
+  DependenceInfo DI(&F, &AR.AA, &AR.SE, &AR.LI, &AR.TI);
   OptimizationRemarkEmitter ORE(&F);
 
   bool AnyLoopRemoved = false;

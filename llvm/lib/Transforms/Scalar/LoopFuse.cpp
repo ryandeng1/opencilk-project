@@ -332,6 +332,11 @@ struct FusionCandidate {
 
       return false;
     }
+    // Generic loop fusion rewrites branch-based loop headers and cannot update
+    // Tapir detach continuations.  Explicit Tapir loops must first be
+    // serialized; their fromtapirloop metadata is retained for DRF reasoning.
+    if (!isa<BranchInst>(Header->getTerminator()))
+      return reportInvalidCandidate(InvalidHeader);
 
     // Require ScalarEvolution to be able to determine a trip count.
     if (!SE.hasLoopInvariantBackedgeTakenCount(L)) {
@@ -574,14 +579,17 @@ private:
   OptimizationRemarkEmitter &ORE;
   AssumptionCache &AC;
   const TargetTransformInfo &TTI;
+  bool TapirDerivedOnly;
 
 public:
   LoopFuser(LoopInfo &LI, DominatorTree &DT, DependenceInfo &DI,
             ScalarEvolution &SE, PostDominatorTree &PDT,
             OptimizationRemarkEmitter &ORE, const DataLayout &DL,
-            AssumptionCache &AC, const TargetTransformInfo &TTI)
+            AssumptionCache &AC, const TargetTransformInfo &TTI,
+            bool TapirDerivedOnly)
       : LDT(LI), DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy), LI(LI),
-        DT(DT), DI(DI), SE(SE), PDT(PDT), ORE(ORE), AC(AC), TTI(TTI) {}
+        DT(DT), DI(DI), SE(SE), PDT(PDT), ORE(ORE), AC(AC), TTI(TTI),
+        TapirDerivedOnly(TapirDerivedOnly) {}
 
   /// This is the main entry point for loop fusion. It will traverse the
   /// specified function and collect candidate loops to fuse, starting at the
@@ -666,6 +674,8 @@ private:
   /// Flow Equivalent sets, sorted by dominance.
   void collectFusionCandidates(const LoopVector &LV) {
     for (Loop *L : LV) {
+      if (TapirDerivedOnly && !L->wasDerivedFromTapirLoop())
+        continue;
       TTI::PeelingPreferences PP =
           gatherPeelingPreferences(L, SE, TTI, std::nullopt, std::nullopt);
       FusionCandidate CurrCand(L, DT, &PDT, ORE, PP);
@@ -2089,7 +2099,7 @@ PreservedAnalyses LoopFusePass::run(Function &F, FunctionAnalysisManager &AM) {
   if (Changed)
     PDT.recalculate(F);
 
-  LoopFuser LF(LI, DT, DI, SE, PDT, ORE, DL, AC, TTI);
+  LoopFuser LF(LI, DT, DI, SE, PDT, ORE, DL, AC, TTI, TapirDerivedOnly);
   Changed |= LF.fuseLoops(F);
   if (!Changed)
     return PreservedAnalyses::all();

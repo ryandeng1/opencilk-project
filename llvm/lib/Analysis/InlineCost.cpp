@@ -28,6 +28,7 @@
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/DataRaceFreeAliasAnalysis.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Config/llvm-config.h"
@@ -81,6 +82,14 @@ static cl::opt<int> InlineThreshold(
 static cl::opt<int> HintThreshold(
     "inlinehint-threshold", cl::Hidden, cl::init(325),
     cl::desc("Threshold for inlining functions with inline hint"));
+
+static cl::opt<int> DRFAASiblingWitnessInlineThreshold(
+    "drf-aa-sibling-witness-inline-threshold", cl::Hidden, cl::init(1500),
+    cl::desc("With -enable-drf-aa-sibling-witness, the inline threshold used "
+             "for a call in a Tapir fork phase (a spawned call or the call in "
+             "the continuation) that passes a literal integer to a parallel "
+             "or self-recursive callee: the literal folds the callee's "
+             "base-case test, exposing the leaf the witness proof needs"));
 
 static cl::opt<int>
     ColdCallSiteThreshold("inline-cold-callsite-threshold", cl::Hidden,
@@ -2072,6 +2081,31 @@ InlineCostCallAnalyzer::getHotCallSiteThreshold(CallBase &Call,
   return std::nullopt;
 }
 
+// A call site in a Tapir fork phase (the detached block of a detach, or the
+// continuation block it returns to) passing a literal integer to the caller
+// itself or to a function that spawns. With the literal the callee's base-case
+// predicate folds, so inlining exposes the serial leaf of a divide-and-conquer
+// recursion that the DRF sibling-witness proof needs to see.
+static bool isTapirForkPhaseLiteralCall(const CallBase &Call,
+                                        const Function &Callee) {
+  const BasicBlock *BB = Call.getParent();
+  bool InPhase = false;
+  for (const BasicBlock *Pred : predecessors(BB))
+    if (const auto *D = dyn_cast<DetachInst>(Pred->getTerminator()))
+      if (D->getDetached() == BB || D->getContinue() == BB) {
+        InPhase = true;
+        break;
+      }
+  if (!InPhase ||
+      none_of(Call.args(), [](const Use &U) { return isa<ConstantInt>(U); }))
+    return false;
+  if (&Callee == Call.getCaller())
+    return true;
+  return any_of(Callee, [](const BasicBlock &B) {
+    return isa<DetachInst>(B.getTerminator());
+  });
+}
+
 void InlineCostCallAnalyzer::updateThreshold(CallBase &Call, Function &Callee) {
   // If no size growth is allowed for this inlining, set Threshold to 0.
   if (!allowSizeGrowth(Call)) {
@@ -2179,6 +2213,10 @@ void InlineCostCallAnalyzer::updateThreshold(CallBase &Call, Function &Callee) {
   }
 
   Threshold += TTI.adjustInliningThreshold(&Call);
+
+  if (isDRFAASiblingWitnessEnabled() && !Caller->hasOptSize() &&
+      isTapirForkPhaseLiteralCall(Call, Callee))
+    Threshold = std::max(Threshold, DRFAASiblingWitnessInlineThreshold.getValue());
 
   // Finally, take the target-specific inlining threshold multiplier into
   // account.

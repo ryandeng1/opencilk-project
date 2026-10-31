@@ -3518,6 +3518,12 @@ def opencilk_abi_bitcode_EQ : Joined<["--"], "opencilk-abi-bitcode=">,
 def fopencilk_enable_pedigrees : Flag<["-"], "fopencilk-enable-pedigrees">,
   Group<f_Group>, Visibility<[ClangOption, CC1Option]>,
   HelpText<"Enable OpenCilk pedigrees">;
+defm hyperobject_associative_math : BoolFOption<"hyperobject-associative-math",
+  LangOpts<"HyperobjectAssociativeMath">, DefaultFalse,
+  PosFlag<SetTrue, [], [ClangOption, CC1Option],
+          "Allow floating-point reassociation in updates of Cilk reducer "
+          "hyperobject views">,
+  NegFlag<SetFalse>>;
 
 def fmudflapth : Flag<["-"], "fmudflapth">, Group<f_Group>;
 def fmudflap : Flag<["-"], "fmudflap">, Group<f_Group>;

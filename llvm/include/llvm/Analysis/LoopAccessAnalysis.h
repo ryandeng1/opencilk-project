@@ -115,6 +115,10 @@ public:
     enum DepType {
       // No dependence.
       NoDep,
+      // The accesses may alias within one loop iteration, but cannot conflict
+      // across distinct iterations.  Unlike NoDep, this result does not imply
+      // an ordinary no-alias fact and must preserve same-iteration ordering.
+      NoCrossIteration,
       // We couldn't determine the direction or the distance.
       Unknown,
       // At least one of the memory access instructions may access a loop
@@ -287,6 +291,12 @@ public:
   /// parallel (data-race-free) loops.  May be null.
   TaskInfo *getTaskInfo() const { return TI; }
 
+  /// Number of access pairs whose dependence was classified as
+  /// NoCrossIteration by the DRF loop contract.
+  unsigned getNumDRFNoCrossIterationDependences() const {
+    return NumDRFNoCrossIterationDependences;
+  }
+
   DenseMap<std::pair<const SCEV *, Type *>,
            std::pair<const SCEV *, const SCEV *>> &
   getPointerBounds() {
@@ -308,7 +318,7 @@ private:
   const DenseMap<Value *, const SCEV *> &SymbolicStrides;
 
   /// Maps access locations (ptr, read/write) to program order.
-  DenseMap<MemAccessInfo, std::vector<unsigned> > Accesses;
+  DenseMap<MemAccessInfo, std::vector<unsigned>> Accesses;
 
   /// Memory access instructions in program order.
   SmallVector<Instruction *, 16> InstMap;
@@ -367,6 +377,9 @@ private:
 
   /// Optional TaskInfo
   TaskInfo *TI;
+
+  /// Dependence pairs for which loop-level DRF changed LAA's classification.
+  unsigned NumDRFNoCrossIterationDependences = 0;
 
   /// Check whether there is a plausible dependence between the two
   /// accesses.
@@ -549,6 +562,7 @@ public:
     Need = false;
     CanUseDiffCheck = true;
     Pointers.clear();
+    NumChecksElidedWithDRF = 0;
     Checks.clear();
     DiffChecks.clear();
     CheckingGroups.clear();
@@ -609,6 +623,10 @@ public:
   /// Returns the number of run-time checks required according to
   /// needsChecking.
   unsigned getNumberOfChecks() const { return Checks.size(); }
+
+  /// Number of grouped runtime pointer checks removed by a DRF proof while
+  /// constructing the current check set.
+  unsigned getNumChecksElidedWithDRF() const { return NumChecksElidedWithDRF; }
 
   /// Print the list run-time memory checks necessary.
   LLVM_ABI void print(raw_ostream &OS, unsigned Depth = 0) const;
@@ -675,10 +693,10 @@ private:
                                    const RuntimeCheckingPtrGroup &CGJ);
 
   /// Return true if every member pair represented by this grouped runtime
-  /// check is proven independent by DRFAA or by an LAA-specific DRF
-  /// loop-carried-dependence proof.
-  bool canElideCheckWithDRFAA(const RuntimeCheckingPtrGroup &CGI,
-                              const RuntimeCheckingPtrGroup &CGJ) const;
+  /// check has no cross-iteration dependence under the DRF contract, or is
+  /// proven independent by one of the selective DRFAA proofs.
+  bool canElideCheckWithDRF(const RuntimeCheckingPtrGroup &CGI,
+                            const RuntimeCheckingPtrGroup &CGJ) const;
 
   MemoryDepChecker &DC;
 
@@ -695,6 +713,8 @@ private:
   /// A list of (pointer-difference, access size) pairs that can be used to
   /// prove that there are no vectorization-preventing dependencies.
   SmallVector<PointerDiffInfo> DiffChecks;
+  /// Grouped checks omitted from the current check set using DRF.
+  unsigned NumChecksElidedWithDRF = 0;
 };
 
 /// Drive the analysis of memory accesses in the loop
@@ -755,6 +775,23 @@ public:
     return PtrRtChecking->getNumberOfChecks();
   }
 
+  /// Return attribution for DRF decisions made while establishing memory
+  /// legality. These are loop-scoped facts, not ordinary no-alias results.
+  bool usedDRFUncomputableBoundsRescue() const {
+    return UsedDRFUncomputableBoundsRescue;
+  }
+  unsigned getNumDRFRuntimeChecksElided() const {
+    return PtrRtChecking->getNumChecksElidedWithDRF();
+  }
+  unsigned getNumDRFNoCrossIterationDependences() const {
+    return DepChecker->getNumDRFNoCrossIterationDependences();
+  }
+  bool usedDRFMemoryLegality() const {
+    return usedDRFUncomputableBoundsRescue() ||
+           getNumDRFRuntimeChecksElided() != 0 ||
+           getNumDRFNoCrossIterationDependences() != 0;
+  }
+
   /// Return true if the block BB needs to be predicated in order for the loop
   /// to be vectorized.
   LLVM_ABI static bool blockNeedsPredication(BasicBlock *BB, Loop *TheLoop,
@@ -764,7 +801,7 @@ public:
   LLVM_ABI bool isInvariant(Value *V) const;
 
   unsigned getNumStores() const { return NumStores; }
-  unsigned getNumLoads() const { return NumLoads;}
+  unsigned getNumLoads() const { return NumLoads; }
 
   /// The diagnostics report generated for the analysis.  E.g. why we
   /// couldn't analyze the loop.
@@ -876,6 +913,11 @@ private:
   /// Indicator that there are two non vectorizable stores to the same uniform
   /// address.
   bool HasStoreStoreDependenceInvolvingLoopInvariantAddress = false;
+
+  /// At least one access with uncomputable bounds was omitted only after DRF
+  /// discharged every runtime-check edge incident to that access.
+  bool UsedDRFUncomputableBoundsRescue = false;
+
   /// Indicator that there is non vectorizable load and store to the same
   /// uniform address.
   bool HasLoadStoreDependenceInvolvingLoopInvariantAddress = false;

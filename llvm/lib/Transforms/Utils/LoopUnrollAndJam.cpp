@@ -690,6 +690,7 @@ static bool preservesBackwardDependence(Instruction *Src, Instruction *Dst,
 //
 // @return true if is safe and false if there is a dependency violation.
 static bool checkDependency(Instruction *Src, Instruction *Dst,
+                            Loop &UnrollLoop,
                             unsigned UnrollLevel, unsigned JamLevel,
                             bool Sequentialized, DependenceInfo &DI) {
   assert(UnrollLevel <= JamLevel &&
@@ -700,6 +701,22 @@ static bool checkDependency(Instruction *Src, Instruction *Dst,
   // Ignore Input dependencies.
   if (isa<LoadInst>(Src) && isa<LoadInst>(Dst))
     return true;
+
+  // Unroll-and-jam preserves the order of operations within each iteration
+  // of the unrolled loop; it only changes the relative schedule of different
+  // iterations.  A loop-local NoCrossIteration fact therefore proves exactly
+  // the property needed here, even when DependenceAnalysis also finds a
+  // dependence between different dynamic instances of this loop under an
+  // enclosing serial loop.  Do not encode that conditional fact by rewriting
+  // the global direction vector: other transforms may change the enclosing
+  // loop schedule, for which that rewrite would be unsound.
+  if (DI.getDRFLoopDependence(&UnrollLoop, Src, Dst) ==
+      DRFLoopDependenceKind::NoCrossIteration) {
+    LLVM_DEBUG(dbgs() << "  Ignoring cross-iteration dependence in DRF loop:\n"
+                      << "  " << *Src << "\n"
+                      << "  " << *Dst << "\n");
+    return true;
+  }
 
   // Check whether unroll-and-jam may violate a dependency.
   // By construction, every dependency will be lexicographically non-negative
@@ -782,8 +799,8 @@ checkDependencies(Loop &Root, const BasicBlockSet &SubLoopBlocks,
       unsigned EarlierDepth = EarlierLoop->getLoopDepth();
       unsigned CommonLoopDepth = std::min(EarlierDepth, CurLoopDepth);
       for (auto *Later : CurrentLoadsAndStores) {
-        if (!checkDependency(Earlier, Later, LoopDepth, CommonLoopDepth, false,
-                             DI))
+        if (!checkDependency(Earlier, Later, Root, LoopDepth, CommonLoopDepth,
+                             false, DI))
           return false;
       }
     }
@@ -792,7 +809,7 @@ checkDependencies(Loop &Root, const BasicBlockSet &SubLoopBlocks,
     for (size_t I = 0; I < NumInsts; ++I) {
       for (size_t J = I; J < NumInsts; ++J) {
         if (!checkDependency(CurrentLoadsAndStores[I], CurrentLoadsAndStores[J],
-                             LoopDepth, CurLoopDepth, true, DI))
+                             Root, LoopDepth, CurLoopDepth, true, DI))
           return false;
       }
     }

@@ -15148,6 +15148,22 @@ static bool needsConversionOfHalfVec(bool OpRequiresConversion, ASTContext &Ctx,
   return HasVectorOfHalfType(E0) && (!E1 || HasVectorOfHalfType(E1));
 }
 
+/// Whether E is a hyperobject view lvalue produced by
+/// Sema::BuildHyperobjectLookup, i.e. a call to one of the scalar
+/// __hyper_lookup builtins.
+static bool isHyperobjectViewLValue(const Expr *E) {
+  const auto *CE = dyn_cast<CallExpr>(E->IgnoreParens());
+  if (!CE)
+    return false;
+  switch (CE->getBuiltinCallee()) {
+  case Builtin::BI__hyper_lookup_internal_1:
+  case Builtin::BI__hyper_lookup_internal_2:
+    return true;
+  default:
+    return false;
+  }
+}
+
 ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
                                     BinaryOperatorKind Opc, Expr *LHSExpr,
                                     Expr *RHSExpr, bool ForFoldExpression) {
@@ -15440,9 +15456,19 @@ ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
     return convertHalfVecBinOp(*this, LHS, RHS, Opc, ResultTy, VK, OK, true,
                                OpLoc, CurFPFeatureOverrides());
 
+  // A reducer declaration licenses schedule-dependent association of the
+  // reduction, so updates of floating-point hyperobject views may be
+  // reassociated under -fhyperobject-associative-math.
+  FPOptionsOverride FPFeatures = CurFPFeatureOverrides();
+  if (getLangOpts().HyperobjectAssociativeMath &&
+      CompResultTy->isFloatingType() && isHyperobjectViewLValue(LHS.get())) {
+    FPFeatures.setAllowFPReassociateOverride(true);
+    FPFeatures.setNoSignedZeroOverride(true);
+  }
+
   return CompoundAssignOperator::Create(
       Context, LHS.get(), RHS.get(), Opc, ResultTy, VK, OK, OpLoc,
-      CurFPFeatureOverrides(), CompLHSTy, CompResultTy);
+      FPFeatures, CompLHSTy, CompResultTy);
 }
 
 /// DiagnoseBitwisePrecedence - Emit a warning when bitwise and comparison

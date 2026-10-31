@@ -109,6 +109,7 @@
 #include "llvm/Transforms/Scalar/LoopIdiomRecognize.h"
 #include "llvm/Transforms/Scalar/LoopInstSimplify.h"
 #include "llvm/Transforms/Scalar/LoopInterchange.h"
+#include "llvm/Transforms/Scalar/LoopFuse.h"
 #include "llvm/Transforms/Scalar/LoopLoadElimination.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Scalar/LoopRotation.h"
@@ -1603,6 +1604,13 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
     OptimizePM.addPass(CorrelatedValuePropagationPass());
     OptimizePM.addPass(InstCombinePass());
   }
+  if (EnableDRFLoopOptimizations) {
+    // A small nested cilk_for is a poor second level of tasking but a useful
+    // SIMD loop.  Serialize only nested loops and retain fromtapirloop
+    // provenance so LAA can apply NoCrossIteration to the resulting loop.
+    OptimizePM.addPass(SerializeSmallTasksPass(/*NestedTapirLoopsOnly=*/true));
+    OptimizePM.addPass(TaskSimplifyPass());
+  }
 
   if (EnableDRFAA)
     OptimizePM.addPass(DRFScopedNoAliasPass());
@@ -1623,9 +1631,19 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
 
   if (PTO.LoopInterchange)
     LPM.addPass(LoopInterchangePass());
+  else if (EnableDRFLoopOptimizations)
+    LPM.addPass(LoopInterchangePass(/*TapirDerivedOnly=*/true));
 
   OptimizePM.addPass(createFunctionToLoopPassAdaptor(
       std::move(LPM), /*UseMemorySSA=*/false, /*UseBlockFrequencyInfo=*/false));
+  if (EnableDRFLoopOptimizations) {
+    // These nest transforms run before Tapir loop outlining, while serialized
+    // Tapir provenance and same-iteration program order are still available.
+    // DependenceAnalysis supplies EQ only at qualifying parallel levels.
+    OptimizePM.addPass(LoopFusePass(/*TapirDerivedOnly=*/true));
+    OptimizePM.addPass(createFunctionToLoopPassAdaptor(
+        LoopUnrollAndJamPass(Level.getSpeedupLevel())));
+  }
 
   // Distribute loops to allow partial vectorization.  I.e. isolate dependences
   // into separate loop that would otherwise inhibit vectorization.  This is

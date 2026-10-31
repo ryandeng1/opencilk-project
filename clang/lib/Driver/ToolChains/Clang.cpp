@@ -6655,6 +6655,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   Args.AddLastArg(CmdArgs, options::OPT_fcilkplus);
   Args.AddLastArg(CmdArgs, options::OPT_fopencilk);
   Args.AddLastArg(CmdArgs, options::OPT_ftapir_EQ);
+  Args.addOptInFlag(CmdArgs, options::OPT_fhyperobject_associative_math,
+                    options::OPT_fno_hyperobject_associative_math);
   if (Args.hasArg(options::OPT_fcilkplus) ||
       Args.hasArg(options::OPT_fopencilk) ||
       Args.hasArg(options::OPT_ftapir_EQ)) {

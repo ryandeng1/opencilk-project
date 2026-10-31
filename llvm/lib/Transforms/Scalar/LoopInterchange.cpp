@@ -1936,6 +1936,11 @@ PreservedAnalyses LoopInterchangePass::run(LoopNest &LN,
   Function &F = *LN.getParent();
   SmallVector<Loop *, 8> LoopList(LN.getLoops());
 
+  if (TapirDerivedOnly && none_of(LoopList, [](const Loop *L) {
+        return L->wasDerivedFromTapirLoop();
+      }))
+    return PreservedAnalyses::all();
+
   if (MaxMemInstrCount < 1) {
     LLVM_DEBUG(dbgs() << "MaxMemInstrCount should be at least 1");
     return PreservedAnalyses::all();
@@ -1958,7 +1963,9 @@ PreservedAnalyses LoopInterchangePass::run(LoopNest &LN,
            << "Computed dependence info, invoking the transform.";
   });
 
-  DependenceInfo DI(&F, &AR.AA, &AR.SE, &AR.LI);
+  // Keep TaskInfo available when a candidate contains an intact Tapir level;
+  // derived serial levels continue to be recognized through loop metadata.
+  DependenceInfo DI(&F, &AR.AA, &AR.SE, &AR.LI, &AR.TI);
   if (!LoopInterchange(&AR.SE, &AR.LI, &DI, &AR.DT, &AR, &ORE).run(LN))
     return PreservedAnalyses::all();
   U.markLoopNestChanged(true);

@@ -372,7 +372,8 @@ LLVM_ABI bool canSinkOrHoistInst(Instruction &I, AAResults *AA,
                                  MemorySSAUpdater &MSSAU,
                                  bool TargetExecutesOncePerLoop, TaskInfo *TI,
                                  SinkAndHoistLICMFlags &LICMFlags,
-                                 OptimizationRemarkEmitter *ORE = nullptr);
+                                 OptimizationRemarkEmitter *ORE = nullptr,
+                                 bool *UsedDRFClobberSuppression = nullptr);
 
 /// Returns the llvm.vector.reduce intrinsic that corresponds to the recurrence
 /// kind.

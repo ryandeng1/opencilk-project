@@ -31,6 +31,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Debug.h"
@@ -1655,6 +1656,24 @@ TaskOutlineMapTy LoopSpawningImpl::outlineAllTapirLoops() {
                            TimePassesIsEnabled);
       TapirLoopHints Hints(L);
       Hints.clearClonedLoopMetadata(VMap);
+      // The outlined helper executes this copy serially, but each execution is
+      // still one part of the original logically parallel iteration space.
+      // Preserve that origin for loop-scoped DRF analyses in the helper.
+      BasicBlock *ClonedLatch =
+          cast<BasicBlock>(VMap[L->getLoopLatch()]);
+      Instruction *ClonedLatchTerm = ClonedLatch->getTerminator();
+      MDNode *ClonedLoopID =
+          ClonedLatchTerm->getMetadata(LLVMContext::MD_loop);
+      if (!findOptionMDForLoopID(ClonedLoopID,
+                                 "llvm.loop.fromtapirloop")) {
+        LLVMContext &Context = ClonedLatch->getContext();
+        MDNode *FromTapir = MDNode::get(
+            Context, MDString::get(Context, "llvm.loop.fromtapirloop"));
+        MDNode *NewLoopID = makePostTransformationMetadata(
+            Context, ClonedLoopID, {}, {FromTapir});
+        ClonedLatchTerm->setMetadata(LLVMContext::MD_loop, NewLoopID);
+      }
+
       Hints.clearStrategy();
     }
 

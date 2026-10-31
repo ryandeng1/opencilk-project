@@ -398,6 +398,10 @@ ENUM_LANGOPT(Cilk, CilkVersion, 3, Cilk_none, NotCompatible, "Enable Cilk langua
 ENUM_LANGOPT(Cilktool, CilktoolKind, 3, Cilktool_None, Compatible,
              "turn on the specified Cilk tool")
 
+LANGOPT(HyperobjectAssociativeMath, 1, 0, NotCompatible,
+        "Allow floating-point reassociation in updates of Cilk reducer "
+        "hyperobject views")
+
 LANGOPT(RetainCommentsFromSystemHeaders, 1, 0, Compatible, "retain documentation comments from system headers in the AST")
 
 LANGOPT(APINotes, 1, 0, NotCompatible, "use external API notes")

@@ -1199,6 +1199,35 @@ bool LoopVectorizationLegality::canVectorizeIndirectUnsafeDependences() {
 
 bool LoopVectorizationLegality::canVectorizeMemory() {
   LAI = &LAIs.getInfo(*TheLoop);
+
+  if (LAI->usedDRFUncomputableBoundsRescue())
+    ORE->emit([&]() {
+      return OptimizationRemarkAnalysis(
+                 Hints->vectorizeAnalysisPassName(), "DRFBoundsRescued",
+                 TheLoop->getStartLoc(), TheLoop->getHeader())
+             << "DRF rescued vectorization legality by discharging all "
+                "runtime-check edges for an access with uncomputable bounds";
+    });
+
+  if (unsigned Count = LAI->getNumDRFRuntimeChecksElided())
+    ORE->emit([&]() {
+      return OptimizationRemarkAnalysis(
+                 Hints->vectorizeAnalysisPassName(), "DRFChecksElided",
+                 TheLoop->getStartLoc(), TheLoop->getHeader())
+             << "DRF eliminated " << ore::NV("ChecksElided", Count)
+             << " grouped runtime pointer check(s)";
+    });
+
+  if (unsigned Count = LAI->getNumDRFNoCrossIterationDependences())
+    ORE->emit([&]() {
+      return OptimizationRemarkAnalysis(
+                 Hints->vectorizeAnalysisPassName(), "DRFNoCrossIteration",
+                 TheLoop->getStartLoc(), TheLoop->getHeader())
+             << "DRF classified "
+             << ore::NV("NoCrossIterationDependences", Count)
+             << " memory dependence(s) as NoCrossIteration";
+    });
+
   const OptimizationRemarkAnalysis *LAR = LAI->getReport();
   if (LAR) {
     ORE->emit([&]() {

@@ -40,6 +40,7 @@
 #define LLVM_ANALYSIS_DEPENDENCEANALYSIS_H
 
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/Analysis/DataRaceFreeAliasAnalysis.h"
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/Instructions.h"
@@ -52,6 +53,7 @@ namespace llvm {
   template <typename T> class ArrayRef;
   class Loop;
   class LoopInfo;
+  class TaskInfo;
   class SCEVConstant;
   class raw_ostream;
 
@@ -341,9 +343,9 @@ namespace llvm {
   ///
   class DependenceInfo {
   public:
-    DependenceInfo(Function *F, AAResults *AA, ScalarEvolution *SE,
-                   LoopInfo *LI)
-        : AA(AA), SE(SE), LI(LI), F(F) {}
+    DependenceInfo(Function *F, AAResults *AA, ScalarEvolution *SE, LoopInfo *LI,
+                   TaskInfo *TI = nullptr)
+        : AA(AA), SE(SE), LI(LI), TI(TI), F(F), DRFDeps(TI) {}
 
     /// Handle transitive invalidation when the cached analysis results go away.
     LLVM_ABI bool invalidate(Function &F, const PreservedAnalyses &PA,
@@ -411,6 +413,13 @@ namespace llvm {
 
     AAResults *getAA() const { return AA; }
 
+    /// Return whether a loop level is logically parallel under the Tapir
+    /// provenance used by the DRF dependence summary.
+    bool isDRFParallelLoop(const Loop *L) const {
+      return DRFDeps.isLogicallyParallel(L);
+    }
+    LLVM_ABI DRFLoopDependenceKind getDRFLoopDependence(
+        const Loop *L, const Instruction *A, const Instruction *B);
     /// depends - Tests for a dependence between the general accesses SrcA and
     /// DstA.  Returns NULL if no dependence; otherwise, returns a Dependence
     /// (or a FullDependence) with as much information as can be gleaned.  The
@@ -425,9 +434,18 @@ namespace llvm {
     AAResults *AA;
     ScalarEvolution *SE;
     LoopInfo *LI;
+    TaskInfo *TI;
     Function *F;
+    DRFLoopDependenceInfo DRFDeps;
     SmallVector<const SCEVPredicate *, 4> Assumptions;
 
+    std::unique_ptr<Dependence>
+    dependsImpl(Instruction *Src, Instruction *Dst,
+                bool UnderRuntimeAssumptions);
+
+    std::unique_ptr<Dependence>
+    refineWithDRF(Instruction *Src, Instruction *Dst,
+                  std::unique_ptr<Dependence> Result);
     /// Subscript - This private struct represents a pair of subscripts from
     /// a pair of potentially multi-dimensional array references. We use a
     /// vector of them to guide subscript partitioning.

@@ -194,6 +194,11 @@ public:
     SmallPtrSet<Instruction *, 4> LoadsWithUnknownDependence;
 
     for (const auto &Dep : *Deps) {
+      // This result carries no store-to-load forwarding relationship.  The
+      // accesses may still alias within an iteration, so leave ordinary alias
+      // analysis and instruction order responsible for that case.
+      if (Dep.Type == MemoryDepChecker::Dependence::NoCrossIteration)
+        continue;
       Instruction *Source = Dep.getSource(DepChecker);
       Instruction *Destination = Dep.getDestination(DepChecker);
 

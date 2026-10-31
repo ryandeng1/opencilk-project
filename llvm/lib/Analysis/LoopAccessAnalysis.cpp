@@ -21,9 +21,10 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
-#include "llvm/Analysis/DataRaceFreeAliasAnalysis.h"
 #include "llvm/Analysis/AliasSetTracker.h"
+#include "llvm/Analysis/DataRaceFreeAliasAnalysis.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopIterator.h"
@@ -71,18 +72,26 @@ using namespace llvm::SCEVPatternMatch;
 
 #define DEBUG_TYPE "loop-accesses"
 
-static cl::opt<unsigned, true>
-VectorizationFactor("force-vector-width", cl::Hidden,
-                    cl::desc("Sets the SIMD width. Zero is autoselect."),
-                    cl::location(VectorizerParams::VectorizationFactor));
-unsigned VectorizerParams::VectorizationFactor;
+STATISTIC(NumDRFUncomputableAccessesRescued,
+          "Number of uncomputable LAA accesses discharged by DRF");
+STATISTIC(NumDRFCanDoRTAliasSetsRescued,
+          "Number of LAA alias-set bounds failures rescued by DRF");
+STATISTIC(NumDRFRuntimeChecksElided,
+          "Number of grouped LAA runtime checks removed by DRF");
+STATISTIC(NumDRFNoCrossIterationDependences,
+          "Number of LAA dependences classified NoCrossIteration by DRF");
 
 static cl::opt<unsigned, true>
-VectorizationInterleave("force-vector-interleave", cl::Hidden,
-                        cl::desc("Sets the vectorization interleave count. "
-                                 "Zero is autoselect."),
-                        cl::location(
-                            VectorizerParams::VectorizationInterleave));
+    VectorizationFactor("force-vector-width", cl::Hidden,
+                        cl::desc("Sets the SIMD width. Zero is autoselect."),
+                        cl::location(VectorizerParams::VectorizationFactor));
+unsigned VectorizerParams::VectorizationFactor;
+
+static cl::opt<unsigned, true> VectorizationInterleave(
+    "force-vector-interleave", cl::Hidden,
+    cl::desc("Sets the vectorization interleave count. "
+             "Zero is autoselect."),
+    cl::location(VectorizerParams::VectorizationInterleave));
 unsigned VectorizerParams::VectorizationInterleave;
 
 static cl::opt<unsigned, true> RuntimeMemoryCheckThreshold(
@@ -151,8 +160,8 @@ bool VectorizerParams::HoistRuntimeChecks;
 /// Enable analysis using Tapir based on the data-race-free assumption.
 static cl::opt<bool> EnableDRFLAA(
     "enable-drf-laa", cl::Hidden,
-    cl::desc("Enable analysis using Tapir based on the data-race-free "
-             "assumption"),
+    cl::desc("Classify eligible Tapir-loop memory accesses as having no "
+             "cross-iteration dependence under the data-race-free contract"),
     cl::init(false));
 
 /// Let LAA selectively drop runtime pointer-check pairs when DRFAA can prove
@@ -502,6 +511,19 @@ bool RuntimePointerChecking::tryToCreateDiffCheck(
 
 static bool isLogicallyParallelViaTapir(const Loop *L, TaskInfo *TI);
 
+/// Under the DRF contract, conflicting ordinary accesses in distinct
+/// iterations of a logically parallel loop cannot refer to the same memory.
+/// This is deliberately weaker than NoAlias: the accesses may still alias in
+/// the same iteration, where their original program order must be preserved.
+static bool hasNoCrossIterationDependence(const Loop *L, TaskInfo *TI,
+                                          const Instruction *A,
+                                          const Instruction *B) {
+  if (!EnableDRFLAA && !EnableDRFLoopOptimizations)
+    return false;
+  return classifyDRFLoopDependence(L, TI, A, B) ==
+         DRFLoopDependenceKind::NoCrossIteration;
+}
+
 bool RuntimePointerChecking::tryToCreateDRFEqualityCheck(
     const RuntimeCheckingPtrGroup &CGI, const RuntimeCheckingPtrGroup &CGJ) {
   if (!EnableDRFEqualityVersioning)
@@ -615,15 +637,21 @@ bool RuntimePointerChecking::tryToCreateDRFEqualityCheck(
   return true;
 }
 
-bool RuntimePointerChecking::canElideCheckWithDRFAA(
+bool RuntimePointerChecking::canElideCheckWithDRF(
     const RuntimeCheckingPtrGroup &CGI,
     const RuntimeCheckingPtrGroup &CGJ) const {
-  if (!EnableDRFCheckElision)
+  if (!EnableDRFLAA && !EnableDRFCheckElision)
     return false;
+
+  // The umbrella uses NoCrossIteration to refine legality, but leaves LAA's
+  // versioned clone intact. Versioning can supply profitable alias scopes and
+  // occasionally better code layout; -enable-drf-laa explicitly opts into
+  // removing those checks with the broader per-level DRF contract.
+  const bool ElideWithNoCrossIteration = EnableDRFLAA;
 
   TaskInfo *TI = DC.getTaskInfo();
   const Loop *InnerLoop = DC.getInnermostLoop();
-  if (!TI || !InnerLoop)
+  if (!InnerLoop)
     return false;
 
   const DataLayout &DL = InnerLoop->getHeader()->getDataLayout();
@@ -706,6 +734,8 @@ bool RuntimePointerChecking::canElideCheckWithDRFAA(
   };
 
   bool SawRequiredPair = false;
+  bool UsedNoCrossIterationProof = false;
+  bool UsedDRFAAProof = false;
   bool UsedLoopCarriedProof = false;
   for (unsigned I : CGI.Members) {
     for (unsigned J : CGJ.Members) {
@@ -732,18 +762,33 @@ bool RuntimePointerChecking::canElideCheckWithDRFAA(
 
       for (unsigned II = 0, IE = IInsts.size(); II != IE; ++II) {
         Instruction *IInst = IInsts[II];
-        std::optional<MemoryLocation> ILoc = MemoryLocation::getOrNone(IInst);
-        if (!ILoc)
-          return false;
         for (unsigned JI = 0, JE = JInsts.size(); JI != JE; ++JI) {
           Instruction *JInst = JInsts[JI];
+
+          if (ElideWithNoCrossIteration &&
+              hasNoCrossIterationDependence(InnerLoop, TI, IInst, JInst)) {
+            UsedNoCrossIterationProof = true;
+            continue;
+          }
+
+          if (!EnableDRFCheckElision || !TI)
+            return false;
+
+          std::optional<MemoryLocation> ILoc =
+              MemoryLocation::getOrNone(IInst);
+          if (!ILoc)
+            return false;
           std::optional<MemoryLocation> JLoc = MemoryLocation::getOrNone(JInst);
           if (!JLoc)
             return false;
 
-          if (drfAliasWouldImplyParallelRace(*TI, *ILoc, *JLoc, IInst, JInst,
-                                             *SE))
+          if (drfAliasWouldImplyRaceViaEnclosingParallelLoop(
+                  InnerLoop, *TI, *ILoc, *JLoc, IInst, JInst, *SE) ||
+              drfAliasWouldImplyParallelRace(*TI, *ILoc, *JLoc, IInst, JInst,
+                                             *SE)) {
+            UsedDRFAAProof = true;
             continue;
+          }
 
           if (!IsDenseLockstepReadBeforeWrite(PI, IOrders[II], IInst, PJ,
                                               JOrders[JI], JInst))
@@ -757,14 +802,17 @@ bool RuntimePointerChecking::canElideCheckWithDRFAA(
   if (!SawRequiredPair)
     return false;
 
-  LLVM_DEBUG(dbgs() << "LAA: Eliding runtime check with "
-                    << (UsedLoopCarriedProof ? "DRF loop-carried proof"
-                                             : "DRFAA noalias proof")
-                    << ":\n"
-                    << "  Group I low/high: " << *CGI.Low << " / "
-                    << *CGI.High << '\n'
-                    << "  Group J low/high: " << *CGJ.Low << " / "
-                    << *CGJ.High << '\n');
+  LLVM_DEBUG({
+    dbgs() << "LAA: Eliding runtime check with DRF proof(s):";
+    if (UsedNoCrossIterationProof)
+      dbgs() << " no-cross-iteration";
+    if (UsedDRFAAProof)
+      dbgs() << " DRFAA-noalias";
+    if (UsedLoopCarriedProof)
+      dbgs() << " dense-loop-carried";
+    dbgs() << "\n  Group I low/high: " << *CGI.Low << " / " << *CGI.High << '\n'
+           << "  Group J low/high: " << *CGJ.Low << " / " << *CGJ.High << '\n';
+  });
   return true;
 }
 
@@ -777,12 +825,15 @@ SmallVector<RuntimePointerCheck, 4> RuntimePointerChecking::generateChecks() {
       const RuntimeCheckingPtrGroup &CGJ = CheckingGroups[J];
 
       if (needsChecking(CGI, CGJ)) {
-        if (canElideCheckWithDRFAA(CGI, CGJ))
+        if (canElideCheckWithDRF(CGI, CGJ)) {
+          ++NumChecksElidedWithDRF;
+          ++NumDRFRuntimeChecksElided;
           continue;
+        }
 
-        CanUseDiffCheck = CanUseDiffCheck &&
-                          (tryToCreateDRFEqualityCheck(CGI, CGJ) ||
-                           tryToCreateDiffCheck(CGI, CGJ));
+        CanUseDiffCheck =
+            CanUseDiffCheck && (tryToCreateDRFEqualityCheck(CGI, CGJ) ||
+                                tryToCreateDiffCheck(CGI, CGJ));
         Checks.emplace_back(&CGI, &CGJ);
       }
     }
@@ -1058,13 +1109,17 @@ public:
   /// Read or write access location.
   typedef PointerIntPair<Value *, 1, bool> MemAccessInfo;
   typedef SmallVector<MemAccessInfo, 8> MemAccessInfoList;
+  typedef std::pair<MemAccessInfo, Type *> AccessTyInfo;
 
   AccessAnalysis(const Loop *TheLoop, AAResults *AA, const LoopInfo *LI,
+                 MemoryDepChecker &DepChecker,
                  MemoryDepChecker::DepCandidates &DA,
                  PredicatedScalarEvolution &PSE,
-                 SmallPtrSetImpl<MDNode *> &LoopAliasScopes)
-      : TheLoop(TheLoop), BAA(*AA), AST(BAA), LI(LI), DepCands(DA), PSE(PSE),
-        LoopAliasScopes(LoopAliasScopes) {
+                 SmallPtrSetImpl<MDNode *> &LoopAliasScopes,
+                 bool &UsedDRFUncomputableBoundsRescue)
+      : TheLoop(TheLoop), BAA(*AA), AST(BAA), LI(LI), DepChecker(DepChecker),
+        DepCands(DA), PSE(PSE), LoopAliasScopes(LoopAliasScopes),
+        UsedDRFUncomputableBoundsRescue(UsedDRFUncomputableBoundsRescue) {
     // We're analyzing dependences across loop iterations.
     BAA.enableCrossIterationMode();
   }
@@ -1099,6 +1154,13 @@ public:
                             Loop *TheLoop, unsigned &RunningDepId,
                             unsigned ASId, bool Assume);
 
+  /// Return true when every runtime-check edge incident to the uncomputable
+  /// access at \p FailedIndex is unnecessary under the DRF contract.
+  bool
+  canDischargeUncomputableAccessWithDRF(unsigned FailedIndex,
+                                        ArrayRef<AccessTyInfo> CheckAccesses,
+                                        bool UseDependencies) const;
+
   /// Check whether we can check the pointers at runtime for
   /// non-intersection.
   ///
@@ -1113,9 +1175,7 @@ public:
 
   /// Goes over all memory accesses, checks whether a RT check is needed
   /// and builds sets of dependent accesses.
-  void buildDependenceSets() {
-    processMemAccesses();
-  }
+  void buildDependenceSets() { processMemAccesses(); }
 
   /// Initial processing of memory accesses determined that we need to
   /// perform dependency checking.
@@ -1176,17 +1236,21 @@ private:
   MemAccessInfoList CheckDeps;
 
   /// Set of pointers that are read only.
-  SmallPtrSet<Value*, 16> ReadOnlyPtr;
+  SmallPtrSet<Value *, 16> ReadOnlyPtr;
 
   /// Batched alias analysis results.
   BatchAAResults BAA;
 
   /// An alias set tracker to partition the access set by underlying object and
-  //intrinsic property (such as TBAA metadata).
+  // intrinsic property (such as TBAA metadata).
   AliasSetTracker AST;
 
   /// The LoopInfo of the loop being checked.
   const LoopInfo *LI;
+
+  /// Maps the pointer/kind records used by runtime checking back to the
+  /// concrete memory instructions whose cross-iteration conflicts matter.
+  MemoryDepChecker &DepChecker;
 
   /// Sets of potentially dependent accesses - members of one set share an
   /// underlying pointer. The set "CheckDeps" identfies which sets really need a
@@ -1210,6 +1274,10 @@ private:
   /// Alias scopes that are declared inside the loop, and as such not valid
   /// across iterations.
   SmallPtrSetImpl<MDNode *> &LoopAliasScopes;
+
+  /// Attribution owned by LoopAccessInfo and set when the bounds gate is
+  /// rescued by the loop-level DRF contract.
+  bool &UsedDRFUncomputableBoundsRescue;
 };
 
 } // end anonymous namespace
@@ -1515,6 +1583,83 @@ findForkedPointer(PredicatedScalarEvolution &PSE,
   return {{replaceSymbolicStrideSCEV(PSE, StridesMap, Ptr), false}};
 }
 
+bool AccessAnalysis::canDischargeUncomputableAccessWithDRF(
+    unsigned FailedIndex, ArrayRef<AccessTyInfo> CheckAccesses,
+    bool UseDependencies) const {
+  if ((!EnableDRFLAA && !EnableDRFCheckElision) ||
+      FailedIndex >= CheckAccesses.size())
+    return false;
+
+  auto GetInstructions = [&](const AccessTyInfo &Entry,
+                             SmallVectorImpl<Instruction *> &Insts) {
+    ArrayRef<unsigned> Orders = DepChecker.getOrderForAccess(
+        Entry.first.getPointer(), Entry.first.getInt());
+    if (Orders.empty())
+      return false;
+
+    // CheckAccesses is split by access type, so do not let instructions for a
+    // differently sized use stand in for this runtime-check entry.
+    for (Instruction *I : DepChecker.getInstructionsForAccess(
+             Entry.first.getPointer(), Entry.first.getInt()))
+      if (getLoadStoreType(I) == Entry.second)
+        Insts.push_back(I);
+    return !Insts.empty();
+  };
+
+  const AccessTyInfo &Failed = CheckAccesses[FailedIndex];
+  SmallVector<Instruction *, 4> FailedInsts;
+  if (!GetInstructions(Failed, FailedInsts))
+    return false;
+
+  bool SawRequiredPair = false;
+  for (unsigned I = 0; I != CheckAccesses.size(); ++I) {
+    if (I == FailedIndex)
+      continue;
+
+    const AccessTyInfo &Partner = CheckAccesses[I];
+    // Mirror RuntimePointerChecking::needsChecking: read/read pairs and pairs
+    // in the same dependence set have no runtime-check edge. Without usable
+    // dependence sets, LAA deliberately places every entry in its own set.
+    if (!Failed.first.getInt() && !Partner.first.getInt())
+      continue;
+
+    if (UseDependencies) {
+      Value *FailedLeader = DepCands.getLeaderValue(Failed.first).getPointer();
+      Value *PartnerLeader =
+          DepCands.getLeaderValue(Partner.first).getPointer();
+      if (FailedLeader == PartnerLeader)
+        continue;
+    }
+
+    SawRequiredPair = true;
+    SmallVector<Instruction *, 4> PartnerInsts;
+    if (!GetInstructions(Partner, PartnerInsts))
+      return false;
+
+    for (Instruction *FailedInst : FailedInsts) {
+      for (Instruction *PartnerInst : PartnerInsts) {
+        if (EnableDRFLAA &&
+            hasNoCrossIterationDependence(TheLoop, DepChecker.getTaskInfo(),
+                                          FailedInst, PartnerInst))
+          continue;
+
+        TaskInfo *TI = DepChecker.getTaskInfo();
+        std::optional<MemoryLocation> FailedLoc =
+            MemoryLocation::getOrNone(FailedInst);
+        std::optional<MemoryLocation> PartnerLoc =
+            MemoryLocation::getOrNone(PartnerInst);
+        if (!EnableDRFCheckElision || !TI || !FailedLoc || !PartnerLoc ||
+            !drfAliasWouldImplyRaceViaEnclosingParallelLoop(
+                TheLoop, *TI, *FailedLoc, *PartnerLoc, FailedInst,
+                PartnerInst, *PSE.getSE()))
+          return false;
+      }
+    }
+  }
+
+  return SawRequiredPair;
+}
+
 bool AccessAnalysis::createCheckForAccess(
     RuntimePointerChecking &RtCheck, MemAccessInfo Access, Type *AccessTy,
     const DenseMap<Value *, const SCEV *> &StridesMap,
@@ -1607,7 +1752,9 @@ bool AccessAnalysis::canCheckPtrAtRT(
     unsigned RunningDepId = 1;
     DenseMap<Value *, unsigned> DepSetId;
 
-    SmallVector<std::pair<MemAccessInfo, Type *>, 4> Retries;
+    SmallVector<AccessTyInfo, 8> CheckAccesses;
+    SmallVector<unsigned, 4> Retries;
+    bool DRFRescuedAliasSet = false;
 
     // First, count how many write and read accesses are in the alias set. Also
     // collect MemAccessInfos for later.
@@ -1638,16 +1785,18 @@ bool AccessAnalysis::canCheckPtrAtRT(
       continue;
     }
 
-    for (auto &Access : AccessInfos) {
-      for (const auto &AccessTy : Accesses[Access]) {
-        if (!createCheckForAccess(RtCheck, Access, AccessTy, StridesMap,
-                                  DepSetId, TheLoop, RunningDepId, ASId,
-                                  false)) {
-          LLVM_DEBUG(dbgs() << "LAA: Can't find bounds for ptr:"
-                            << *Access.getPointer() << '\n');
-          Retries.emplace_back(Access, AccessTy);
-          CanDoAliasSetRT = false;
-        }
+    for (auto &Access : AccessInfos)
+      for (Type *AccessTy : Accesses[Access])
+        CheckAccesses.emplace_back(Access, AccessTy);
+
+    for (unsigned Index = 0; Index != CheckAccesses.size(); ++Index) {
+      const auto &[Access, AccessTy] = CheckAccesses[Index];
+      if (!createCheckForAccess(RtCheck, Access, AccessTy, StridesMap, DepSetId,
+                                TheLoop, RunningDepId, ASId, false)) {
+        LLVM_DEBUG(dbgs() << "LAA: Can't find bounds for ptr:"
+                          << *Access.getPointer() << '\n');
+        Retries.push_back(Index);
+        CanDoAliasSetRT = false;
       }
     }
 
@@ -1669,17 +1818,35 @@ bool AccessAnalysis::canCheckPtrAtRT(
       // We know that we need these checks, so we can now be more aggressive
       // and add further checks if required (overflow checks).
       CanDoAliasSetRT = true;
-      for (const auto &[Access, AccessTy] : Retries) {
-        if (!createCheckForAccess(RtCheck, Access, AccessTy, StridesMap,
-                                  DepSetId, TheLoop, RunningDepId, ASId,
-                                  /*Assume=*/true)) {
-          CanDoAliasSetRT = false;
-          UncomputablePtr = Access.getPointer();
-          if (!AllowPartial)
-            break;
+      for (unsigned RetryIndex : Retries) {
+        const auto &[Access, AccessTy] = CheckAccesses[RetryIndex];
+        if (createCheckForAccess(RtCheck, Access, AccessTy, StridesMap,
+                                 DepSetId, TheLoop, RunningDepId, ASId,
+                                 /*Assume=*/true))
+          continue;
+
+        // Bounds are unavailable even with LAA's runtime assumptions. Omit
+        // this access only when DRF discharges every runtime-check edge that
+        // would have involved it; one uncovered partner keeps the usual bail.
+        if (canDischargeUncomputableAccessWithDRF(RetryIndex, CheckAccesses,
+                                                  IsDepCheckNeeded)) {
+          ++NumDRFUncomputableAccessesRescued;
+          UsedDRFUncomputableBoundsRescue = true;
+          DRFRescuedAliasSet = true;
+          LLVM_DEBUG(dbgs() << "LAA: DRF discharged uncomputable ptr:"
+                            << *Access.getPointer() << '\n');
+          continue;
         }
+
+        CanDoAliasSetRT = false;
+        UncomputablePtr = Access.getPointer();
+        if (!AllowPartial)
+          break;
       }
     }
+
+    if (DRFRescuedAliasSet && CanDoAliasSetRT)
+      ++NumDRFCanDoRTAliasSetsRescued;
 
     CanDoRT &= CanDoAliasSetRT;
     MayNeedRTCheck |= NeedsAliasSetRTCheck;
@@ -2049,6 +2216,7 @@ MemoryDepChecker::VectorizationSafetyStatus
 MemoryDepChecker::Dependence::isSafeForVectorization(DepType Type) {
   switch (Type) {
   case NoDep:
+  case NoCrossIteration:
   case Forward:
   case BackwardVectorizable:
     return VectorizationSafetyStatus::Safe;
@@ -2067,6 +2235,7 @@ MemoryDepChecker::Dependence::isSafeForVectorization(DepType Type) {
 bool MemoryDepChecker::Dependence::isBackward() const {
   switch (Type) {
   case NoDep:
+  case NoCrossIteration:
   case Forward:
   case ForwardButPreventsForwarding:
   case Unknown:
@@ -2092,6 +2261,7 @@ bool MemoryDepChecker::Dependence::isForward() const {
     return true;
 
   case NoDep:
+  case NoCrossIteration:
   case Unknown:
   case BackwardVectorizable:
   case Backward:
@@ -2162,8 +2332,7 @@ void MemoryDepChecker::mergeInStatus(VectorizationSafetyStatus S) {
 
 /// Returns true if this loop is logically parallel as indicated by Tapir.
 static bool isLogicallyParallelViaTapir(const Loop *L, TaskInfo *TI) {
-  return L->wasDerivedFromTapirLoop() ||
-    (TI && getTaskIfTapirLoopStructure(L, TI));
+  return isDRFLogicallyParallelLoop(L, TI);
 }
 
 /// Given a dependence-distance \p Dist between two memory accesses, that have
@@ -2310,11 +2479,6 @@ MemoryDepChecker::getDependenceDistanceStrideAndSize(
   Type *ATy = getLoadStoreType(AInst);
   Type *BTy = getLoadStoreType(BInst);
 
-  // Under certain assumptions, Tapir can guarantee that there are no
-  // loop-carried dependencies.
-  if (EnableDRFLAA && isLogicallyParallelViaTapir(InnermostLoop, TI))
-    return MemoryDepChecker::Dependence::NoDep;
-
   // We cannot check pointers in different address spaces.
   if (APtr->getType()->getPointerAddressSpace() !=
       BPtr->getType()->getPointerAddressSpace())
@@ -2406,6 +2570,20 @@ MemoryDepChecker::Dependence::DepType
 MemoryDepChecker::isDependent(const MemAccessInfo &A, unsigned AIdx,
                               const MemAccessInfo &B, unsigned BIdx) {
   assert(AIdx < BIdx && "Must pass arguments in program order");
+  assert(BIdx < InstMap.size() && "Access index out of range");
+
+  // AccessAnalysis has already used AA in cross-iteration mode, including
+  // DRFAA when enabled, to omit pairs that AA can discharge.  For a remaining
+  // pair in strict DRF mode, an eligible cross-iteration conflict would be a
+  // race in the logically parallel source loop.  Same-iteration aliasing
+  // remains possible and must retain program order, which is why this fallback
+  // is NoCrossIteration rather than NoDep or NoAlias.
+  if (hasNoCrossIterationDependence(InnermostLoop, TI, InstMap[AIdx],
+                                    InstMap[BIdx])) {
+    ++NumDRFNoCrossIterationDependences;
+    ++::NumDRFNoCrossIterationDependences;
+    return Dependence::NoCrossIteration;
+  }
 
   // Check if we can prove that Sink only accesses memory after Src's end or
   // vice versa. The helper is used to perform the checks only on the exit paths
@@ -2665,12 +2843,6 @@ bool MemoryDepChecker::areDepsSafe(const DepCandidates &DepCands,
 
             Dependence::DepType Type =
                 isDependent(*A.first, A.second, *B.first, B.second);
-            // Backward dependencies cannot happen in Tapir loops.
-            if ((Dependence::Backward == Type ||
-                 Dependence::BackwardVectorizable == Type ||
-                 Dependence::BackwardVectorizableButPreventsForwarding == Type)
-                && isLogicallyParallelViaTapir(InnermostLoop, TI))
-              Type = Dependence::NoDep;
             mergeInStatus(Dependence::isSafeForVectorization(Type));
 
             // Gather dependences unless we accumulated MaxDependences
@@ -2715,6 +2887,7 @@ MemoryDepChecker::getInstructionsForAccess(Value *Ptr, bool IsWrite) const {
 
 const char *MemoryDepChecker::Dependence::DepName[] = {
     "NoDep",
+    "NoCrossIteration",
     "Unknown",
     "IndirectUnsafe",
     "Forward",
@@ -2789,8 +2962,7 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
   PtrRtChecking->Pointers.clear();
   PtrRtChecking->Need = false;
 
-  const bool IsAnnotatedParallel = TheLoop->isAnnotatedParallel() ||
-    (EnableDRFLAA && isLogicallyParallelViaTapir(TheLoop, TI));
+  const bool IsAnnotatedParallel = TheLoop->isAnnotatedParallel();
 
   const bool EnableMemAccessVersioningOfLoop =
       EnableMemAccessVersioning &&
@@ -2917,7 +3089,8 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
   }
 
   MemoryDepChecker::DepCandidates DepCands;
-  AccessAnalysis Accesses(TheLoop, AA, LI, DepCands, *PSE, LoopAliasScopes);
+  AccessAnalysis Accesses(TheLoop, AA, LI, *DepChecker, DepCands, *PSE,
+                          LoopAliasScopes, UsedDRFUncomputableBoundsRescue);
 
   // Holds the analyzed pointers. We don't want to call getUnderlyingObjects
   // multiple times on the same object. If the ptr is accessed twice, once
@@ -3125,6 +3298,7 @@ void LoopAccessInfo::emitUnsafeDependenceRemark() {
 
   switch (Dep.Type) {
   case MemoryDepChecker::Dependence::NoDep:
+  case MemoryDepChecker::Dependence::NoCrossIteration:
   case MemoryDepChecker::Dependence::Forward:
   case MemoryDepChecker::Dependence::BackwardVectorizable:
     llvm_unreachable("Unexpected dependence");

@@ -14,6 +14,7 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/CodeMetrics.h"
+#include "llvm/Analysis/DataRaceFreeAliasAnalysis.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
@@ -33,24 +34,43 @@ using namespace llvm;
 #define DEBUG_TYPE "serialize-small-tasks"
 
 static cl::opt<bool> SerializeUnprofitableLoops(
-  "serialize-unprofitable-loops", cl::Hidden, cl::init(true),
-  cl::desc("Serialize any Tapir tasks found to be unprofitable."));
+    "serialize-unprofitable-loops", cl::Hidden, cl::init(true),
+    cl::desc("Serialize any Tapir tasks found to be unprofitable."));
 
-static bool trySerializeSmallLoop(Loop *L, DominatorTree &DT, LoopInfo *LI,
-                                  ScalarEvolution &SE,
-                                  const TargetTransformInfo &TTI,
-                                  AssumptionCache &AC, TaskInfo *TI,
-                                  OptimizationRemarkEmitter &ORE,
-                                  TargetLibraryInfo *TLI,
-                                  BlockFrequencyInfo *BFI) {
+static cl::opt<unsigned> DRFSequentialSIMDMaxTripCount(
+    "drf-sequential-simd-max-trip-count", cl::init(64), cl::Hidden,
+    cl::desc("Largest nested Tapir-loop trip count serialized for DRF SIMD"));
+
+static bool
+trySerializeSmallLoop(Loop *L, DominatorTree &DT, LoopInfo *LI,
+                      ScalarEvolution &SE, const TargetTransformInfo &TTI,
+                      AssumptionCache &AC, TaskInfo *TI,
+                      OptimizationRemarkEmitter &ORE, TargetLibraryInfo *TLI,
+                      BlockFrequencyInfo *BFI, bool NestedTapirLoopsOnly) {
   bool Changed = false;
   for (Loop *SubL : *L)
-    Changed |=
-        trySerializeSmallLoop(SubL, DT, LI, SE, TTI, AC, TI, ORE, TLI, BFI);
+    Changed |= trySerializeSmallLoop(SubL, DT, LI, SE, TTI, AC, TI, ORE, TLI,
+                                     BFI, NestedTapirLoopsOnly);
 
   Task *T = getTaskIfTapirLoopStructure(L, TI);
   if (!T)
     return Changed;
+
+  // The DRF sequential-SIMD mode is deliberately limited to a parallel loop
+  // nested in another Tapir loop.  Serializing the outer loop would discard
+  // useful task parallelism instead of only removing nested spawn structure.
+  if (NestedTapirLoopsOnly) {
+    bool HasTapirAncestor = false;
+    for (const Loop *Parent = L->getParentLoop(); Parent;
+         Parent = Parent->getParentLoop()) {
+      if (isDRFLogicallyParallelLoop(Parent, TI)) {
+        HasTapirAncestor = true;
+        break;
+      }
+    }
+    if (!HasTapirAncestor)
+      return Changed;
+  }
 
   // Skip any loop for which stripmining is explicitly disabled.
   if (TM_Disable == hasLoopStripmineTransformation(L))
@@ -80,18 +100,19 @@ static bool trySerializeSmallLoop(Loop *L, DominatorTree &DT, LoopInfo *LI,
   // Find a constant trip count if available
   unsigned ConstTripCount = getConstTripCount(L, SE);
 
-  if (!ConstTripCount || SMP.Count < ConstTripCount)
+  if (!ConstTripCount ||
+      (NestedTapirLoopsOnly ? ConstTripCount > DRFSequentialSIMDMaxTripCount
+                            : SMP.Count < ConstTripCount))
     return Changed;
 
   // Serialize the loop's detach, since it appears to be too small to be worth
   // parallelizing.
   ORE.emit([&]() {
-             return OptimizationRemark("serialize-small-tasks",
-                                       "SerializingSmallLoop",
-                                       L->getStartLoc(), L->getHeader())
-               << "Serializing parallel loop that appears to be unprofitable "
-               << "to parallelize.";
-           });
+    return OptimizationRemark("serialize-small-tasks", "SerializingSmallLoop",
+                              L->getStartLoc(), L->getHeader())
+           << "Serializing parallel loop that appears to be unprofitable "
+           << "to parallelize.";
+  });
   SerializeDetach(cast<DetachInst>(L->getHeader()->getTerminator()), T,
                   /* ReplaceWithTaskFrame = */ taskContainsSync(T), &DT);
   Hints.clearHintsMetadata();
@@ -157,7 +178,7 @@ bool SerializeSmallTasks::runOnFunction(Function &F) {
   LoopInfo *LI = &getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   const TargetTransformInfo &TTI =
-    getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
+      getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
   auto &AC = getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
   // For the old PM, we can't use OptimizationRemarkEmitter as an analysis
   // pass.  Function analyses need to be preserved across loop transformations
@@ -165,13 +186,13 @@ bool SerializeSmallTasks::runOnFunction(Function &F) {
   OptimizationRemarkEmitter ORE(&F);
 
   LLVM_DEBUG(dbgs() << "SerializeSmallTasks running on function " << F.getName()
-             << "\n");
+                    << "\n");
 
   bool Changed = false;
   if (SerializeUnprofitableLoops)
     for (Loop *L : *LI)
       Changed |= trySerializeSmallLoop(L, DT, LI, SE, TTI, AC, &TI, ORE, &TLI,
-                                       nullptr);
+                                       nullptr, false);
 
   if (Changed)
     // Recalculate TaskInfo
@@ -199,13 +220,13 @@ PreservedAnalyses SerializeSmallTasksPass::run(Function &F,
   auto &BFI = AM.getResult<BlockFrequencyAnalysis>(F);
 
   LLVM_DEBUG(dbgs() << "SerializeSmallTasks running on function " << F.getName()
-             << "\n");
+                    << "\n");
 
   bool Changed = false;
   if (SerializeUnprofitableLoops)
     for (Loop *L : LI)
-      Changed |=
-          trySerializeSmallLoop(L, DT, &LI, SE, TTI, AC, &TI, ORE, &TLI, &BFI);
+      Changed |= trySerializeSmallLoop(L, DT, &LI, SE, TTI, AC, &TI, ORE, &TLI,
+                                       &BFI, NestedTapirLoopsOnly);
 
   if (!Changed)
     return PreservedAnalyses::all();

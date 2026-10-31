@@ -102,6 +102,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
 #include <memory>
 #include <utility>
@@ -114,9 +115,34 @@ class Loop;
 class LLVMContext;
 class MemoryAccess;
 class MemorySSAWalker;
+class ScalarEvolution;
+struct DRFAADeltaSetProofCache;
 class Module;
 class TaskInfo;
 class raw_ostream;
+
+/// Which DRF-specific MemorySSA rule suppressed a clobber candidate.
+/// None means that the walker did not use a DRF-specific suppression.
+enum class MemorySSAClobberReason : uint8_t {
+  None,
+  DRFParallelTasks,
+  DRFLoopInvariantLoad,
+  DRFAliasProof,
+};
+
+/// A clobber result together with the first DRF-specific suppression used by
+/// the walk.  This records how MemorySSA reached the result; it does not claim
+/// that ordinary AA could not independently reach the same result.  In
+/// particular, DRFLoopInvariantLoad is valid only for the loop scope supplied
+/// to the corresponding walker query; it is not a global no-alias fact.
+struct MemorySSAClobberingAccessResult {
+  MemoryAccess *Access = nullptr;
+  MemorySSAClobberReason Reason = MemorySSAClobberReason::None;
+
+  bool wasClobberSuppressedByDRF() const {
+    return Reason != MemorySSAClobberReason::None;
+  }
+};
 
 namespace MSSAHelpers {
 
@@ -268,8 +294,14 @@ public:
   inline bool isOptimized() const;
   /// Return the MemoryAccess associated with the optimized use, or nullptr.
   inline MemoryAccess *getOptimized() const;
+  /// Return the DRF-specific rule used to compute this cached result, if any.
+  MemorySSAClobberReason getOptimizedClobberReason() const {
+    return OptimizedClobberReason;
+  }
   /// Sets the optimized use for a MemoryDef.
-  inline void setOptimized(MemoryAccess *);
+  inline void
+  setOptimized(MemoryAccess *,
+               MemorySSAClobberReason = MemorySSAClobberReason::None);
 
   /// Reset the ID of what this MemoryUse was optimized to, causing it to
   /// be rewalked by the walker if necessary.
@@ -291,16 +323,24 @@ protected:
   // Use deleteValue() to delete a generic MemoryUseOrDef.
   ~MemoryUseOrDef() = default;
 
-  void setDefiningAccess(MemoryAccess *DMA, bool Optimized = false) {
+  void setDefiningAccess(
+      MemoryAccess *DMA, bool Optimized = false,
+      MemorySSAClobberReason Reason = MemorySSAClobberReason::None) {
     if (!Optimized) {
+      OptimizedClobberReason = MemorySSAClobberReason::None;
       setOperand(0, DMA);
       return;
     }
-    setOptimized(DMA);
+    setOptimized(DMA, Reason);
+  }
+
+  void setOptimizedClobberReason(MemorySSAClobberReason Reason) {
+    OptimizedClobberReason = Reason;
   }
 
 private:
   Instruction *MemoryInstruction;
+  MemorySSAClobberReason OptimizedClobberReason = MemorySSAClobberReason::None;
 };
 
 /// Represents read-only accesses to memory
@@ -327,8 +367,11 @@ public:
 
   LLVM_ABI void print(raw_ostream &OS) const;
 
-  void setOptimized(MemoryAccess *DMA) {
+  void
+  setOptimized(MemoryAccess *DMA,
+               MemorySSAClobberReason Reason = MemorySSAClobberReason::None) {
     OptimizedID = DMA->getID();
+    setOptimizedClobberReason(Reason);
     setOperand(0, DMA);
   }
 
@@ -345,6 +388,7 @@ public:
 
   void resetOptimized() {
     OptimizedID = INVALID_MEMORYACCESS_ID;
+    setOptimizedClobberReason(MemorySSAClobberReason::None);
   }
 
 protected:
@@ -390,9 +434,12 @@ public:
     return MA->getValueID() == MemoryDefVal;
   }
 
-  void setOptimized(MemoryAccess *MA) {
+  void
+  setOptimized(MemoryAccess *MA,
+               MemorySSAClobberReason Reason = MemorySSAClobberReason::None) {
     setOperand(1, MA);
     OptimizedID = MA->getID();
+    setOptimizedClobberReason(Reason);
   }
 
   MemoryAccess *getOptimized() const {
@@ -406,6 +453,7 @@ public:
   void resetOptimized() {
     OptimizedID = INVALID_MEMORYACCESS_ID;
     setOperand(1, nullptr);
+    setOptimizedClobberReason(MemorySSAClobberReason::None);
   }
 
   LLVM_ABI void print(raw_ostream &OS) const;
@@ -681,11 +729,12 @@ inline MemoryAccess *MemoryUseOrDef::getOptimized() const {
   return cast<MemoryUse>(this)->getOptimized();
 }
 
-inline void MemoryUseOrDef::setOptimized(MemoryAccess *MA) {
+inline void MemoryUseOrDef::setOptimized(MemoryAccess *MA,
+                                         MemorySSAClobberReason Reason) {
   if (auto *MD = dyn_cast<MemoryDef>(this))
-    MD->setOptimized(MA);
+    MD->setOptimized(MA, Reason);
   else
-    cast<MemoryUse>(this)->setOptimized(MA);
+    cast<MemoryUse>(this)->setOptimized(MA, Reason);
 }
 
 inline void MemoryUseOrDef::resetOptimized() {
@@ -703,7 +752,7 @@ DEFINE_TRANSPARENT_OPERAND_ACCESSORS(MemoryPhi, MemoryAccess)
 class MemorySSA {
 public:
   LLVM_ABI MemorySSA(Function &, AliasAnalysis *, DominatorTree *,
-                     TaskInfo * = nullptr);
+                     TaskInfo * = nullptr, ScalarEvolution * = nullptr);
   LLVM_ABI MemorySSA(Loop &, AliasAnalysis *, DominatorTree *);
 
   // MemorySSA must remain where it's constructed; Walkers it creates store
@@ -728,6 +777,11 @@ public:
   }
 
   DominatorTree &getDomTree() const { return *DT; }
+  bool usesScalarEvolution() const { return SE != nullptr; }
+  ScalarEvolution *getScalarEvolution() const { return SE; }
+  DRFAADeltaSetProofCache *getDRFAADeltaSetProofCache() const {
+    return DeltaSetProofCache;
+  }
 
   LLVM_ABI void dump() const;
   LLVM_ABI void print(raw_ostream &) const;
@@ -885,6 +939,8 @@ private:
   AliasAnalysis *AA = nullptr;
   DominatorTree *DT;
   TaskInfo *TI = nullptr;
+  ScalarEvolution *SE = nullptr;
+  DRFAADeltaSetProofCache *DeltaSetProofCache = nullptr;
   Function *F = nullptr;
   Loop *L = nullptr;
 
@@ -1065,6 +1121,27 @@ public:
   /// but takes a MemoryAccess instead of an Instruction.
   virtual MemoryAccess *getClobberingMemoryAccess(MemoryAccess *,
                                                   BatchAAResults &AA) = 0;
+
+  /// Return the clobber and record whether the walk used a DRF-specific rule.
+  /// DRFScope opts the query into loop-scoped reasoning; clients must not reuse
+  /// a DRFLoopInvariantLoad result outside that loop.
+  MemorySSAClobberingAccessResult
+  getClobberingMemoryAccessWithReason(const Instruction *I, BatchAAResults &AA,
+                                      const Loop *DRFScope) {
+    MemoryAccess *MA = MSSA->getMemoryAccess(I);
+    assert(MA && "Handed an instruction that MemorySSA doesn't recognize?");
+    return getClobberingMemoryAccessWithReason(MA, AA, DRFScope);
+  }
+
+  /// Does the same thing as the Instruction overload, but takes a
+  /// MemoryAccess.  Walkers without DRF support retain the ordinary result and
+  /// report no DRF reason.
+  virtual MemorySSAClobberingAccessResult
+  getClobberingMemoryAccessWithReason(MemoryAccess *MA, BatchAAResults &AA,
+                                      const Loop *DRFScope) {
+    (void)DRFScope;
+    return {getClobberingMemoryAccess(MA, AA), MemorySSAClobberReason::None};
+  }
 
   /// Given a potentially clobbering memory access and a new location,
   /// calling this will give you the nearest dominating clobbering MemoryAccess

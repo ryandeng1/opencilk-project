@@ -19,9 +19,13 @@ class Function;
 /// the overhead of a spawn.
 class SerializeSmallTasksPass : public PassInfoMixin<SerializeSmallTasksPass> {
 public:
-  explicit SerializeSmallTasksPass() {}
+  explicit SerializeSmallTasksPass(bool NestedTapirLoopsOnly = false)
+      : NestedTapirLoopsOnly(NestedTapirLoopsOnly) {}
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+
+private:
+  bool NestedTapirLoopsOnly;
 };
 
 } // end namespace llvm

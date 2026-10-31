@@ -146,7 +146,13 @@ static bool CanProveNotTakenFirstIteration(const BasicBlock *ExitBlock,
   }
 
   auto DL = ExitBlock->getModule()->getDataLayout();
-  auto *IVStart = LHS->getIncomingValueForBlock(CurLoop->getLoopPreheader());
+  auto *LoopPred = CurLoop->getLoopPredecessor();
+  if (!LoopPred)
+    return false;
+  int IncomingIdx = LHS->getBasicBlockIndex(LoopPred);
+  if (IncomingIdx < 0)
+    return false;
+  auto *IVStart = LHS->getIncomingValue(IncomingIdx);
   auto *SimpleValOrNull = simplifyCmpInst(
       Pred, IVStart, RHS, {DL, /*TLI*/ nullptr, DT, /*AC*/ nullptr, BI});
   auto *SimpleCst = dyn_cast_or_null<Constant>(SimpleValOrNull);

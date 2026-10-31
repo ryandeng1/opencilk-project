@@ -57,6 +57,7 @@
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/TapirTaskInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
@@ -65,6 +66,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 
 using namespace llvm;
 
@@ -122,6 +124,42 @@ static cl::opt<unsigned> MIVMaxLevelThreshold(
     cl::desc("Maximum depth allowed for the recursive algorithm used to "
              "explore MIV direction vectors."));
 
+static cl::opt<bool> EnableDRFDA(
+    "enable-drf-da", cl::init(false), cl::Hidden,
+    cl::desc("Refine loop dependence analysis using data-race freedom"));
+
+// Soundness guard for DependenceInfo::refineWithDRF.
+//
+// A NoCrossIteration fact for a Tapir-derived loop only covers pairs of
+// accesses that execute in the *same dynamic instance* of that loop, i.e.
+// whose iteration vectors agree at every enclosing level.  Iterations of two
+// different instances (for example the parallel loops run by successive
+// iterations of an enclosing serial loop) are ordered by the loop's implicit
+// sync and may legitimately carry a dependence, even though their parallel
+// indices differ.  With this option on, a parallel level is forced to EQ only
+// while every enclosing common level is already exactly EQ, so only
+// dependences whose outermost differing level is parallel are removed.  This
+// is the direction-vector form of the delta-set proof's "outermost differing
+// coordinate must be parallel" rule.
+//
+// Off restores the original unconditional rewrite.  That rewrite is unsound
+// under a serial enclosing loop: for `for t { cilk_for j { A[j][t+1] =
+// A[j+1][t] + 1; } }` it turns the real (<, >) dependence into (<, =), and
+// loop-interchange and unroll-and-jam then miscompile the nest (see the
+// drf-serial-outer tests).  It is kept only for experiments.
+static cl::opt<bool> DRFDARequireEQPrefix(
+    "drf-da-require-eq-prefix", cl::init(true), cl::Hidden,
+    cl::desc("Refine a DRF-parallel dependence level to EQ only when every "
+             "enclosing common loop level is already EQ (sound). Off restores "
+             "the unconditional rewrite, which is unsound under serial outer "
+             "loops."));
+
+static bool useDRFDA() {
+  // Keep the broader experimental switch as a compatibility alias while
+  // allowing DA to be evaluated independently of the passes it schedules.
+  return EnableDRFDA || EnableDRFLoopOptimizations;
+}
+
 //===----------------------------------------------------------------------===//
 // basics
 
@@ -130,7 +168,8 @@ DependenceAnalysis::run(Function &F, FunctionAnalysisManager &FAM) {
   auto &AA = FAM.getResult<AAManager>(F);
   auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
   auto &LI = FAM.getResult<LoopAnalysis>(F);
-  return DependenceInfo(&F, &AA, &SE, &LI);
+  TaskInfo *TI = useDRFDA() ? &FAM.getResult<TaskAnalysis>(F) : nullptr;
+  return DependenceInfo(&F, &AA, &SE, &LI, TI);
 }
 
 AnalysisKey DependenceAnalysis::Key;
@@ -139,6 +178,7 @@ INITIALIZE_PASS_BEGIN(DependenceAnalysisWrapperPass, "da",
                       "Dependence Analysis", true, true)
 INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(TaskInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
 INITIALIZE_PASS_END(DependenceAnalysisWrapperPass, "da", "Dependence Analysis",
                     true, true)
@@ -156,7 +196,9 @@ bool DependenceAnalysisWrapperPass::runOnFunction(Function &F) {
   auto &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
   auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-  info.reset(new DependenceInfo(&F, &AA, &SE, &LI));
+  TaskInfo *TI =
+      useDRFDA() ? &getAnalysis<TaskInfoWrapperPass>().getTaskInfo() : nullptr;
+  info.reset(new DependenceInfo(&F, &AA, &SE, &LI, TI));
   return false;
 }
 
@@ -168,6 +210,8 @@ void DependenceAnalysisWrapperPass::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesAll();
   AU.addRequiredTransitive<AAResultsWrapperPass>();
   AU.addRequiredTransitive<ScalarEvolutionWrapperPass>();
+  if (useDRFDA())
+    AU.addRequiredTransitive<TaskInfoWrapperPass>();
   AU.addRequiredTransitive<LoopInfoWrapperPass>();
 }
 
@@ -3646,11 +3690,111 @@ bool DependenceInfo::invalidate(Function &F, const PreservedAnalyses &PA,
   // Check transitive dependencies.
   return Inv.invalidate<AAManager>(F, PA) ||
          Inv.invalidate<ScalarEvolutionAnalysis>(F, PA) ||
-         Inv.invalidate<LoopAnalysis>(F, PA);
+         Inv.invalidate<LoopAnalysis>(F, PA) ||
+         (TI && Inv.invalidate<TaskAnalysis>(F, PA));
 }
 
 SCEVUnionPredicate DependenceInfo::getRuntimeAssumptions() const {
   return SCEVUnionPredicate(Assumptions, *SE);
+}
+
+DRFLoopDependenceKind
+DependenceInfo::getDRFLoopDependence(const Loop *L, const Instruction *A,
+                                     const Instruction *B) {
+  if (!useDRFDA())
+    return DRFLoopDependenceKind::Unknown;
+  return DRFDeps.get(L, A, B);
+}
+
+std::unique_ptr<Dependence>
+DependenceInfo::depends(Instruction *Src, Instruction *Dst,
+                        bool UnderRuntimeAssumptions) {
+  return refineWithDRF(Src, Dst,
+                       dependsImpl(Src, Dst, UnderRuntimeAssumptions));
+}
+
+std::unique_ptr<Dependence>
+DependenceInfo::refineWithDRF(Instruction *Src, Instruction *Dst,
+                              std::unique_ptr<Dependence> Result) {
+  if (!useDRFDA() || !Result)
+    return Result;
+
+  // Dependence-analysis levels are the common surrounding loops, ordered from
+  // outermost to innermost.  Refine only the levels for which the shared DRF
+  // summary proves that distinct Tapir iterations cannot conflict.
+  Loop *Common = LI->getLoopFor(Src->getParent());
+  while (Common && !Common->contains(Dst->getParent()))
+    Common = Common->getParentLoop();
+  if (!Common)
+    return Result;
+
+  SmallVector<const Loop *, 8> CommonLoops;
+  for (const Loop *L = Common; L; L = L->getParentLoop())
+    CommonLoops.push_back(L);
+  std::reverse(CommonLoops.begin(), CommonLoops.end());
+
+  // Collect the levels to force to EQ, walking from the outermost common loop
+  // inward.  The DRF fact for a Tapir-derived level covers only pairs in the
+  // same dynamic instance of that loop, i.e. pairs whose iteration vectors
+  // agree at every level above it.  Once an enclosing serial level can differ
+  // (its direction admits LT or GT; a confused result has no direction vector
+  // and may differ anywhere), the pair may belong to different instances of
+  // the parallel loop, which are ordered by its implicit sync, and no inner
+  // level may be tightened.  See DRFDARequireEQPrefix for the full argument
+  // and the miscompile the guard prevents.
+  SmallVector<unsigned, 4> DRFLevels;
+  for (unsigned I = 0, E = CommonLoops.size(); I != E; ++I) {
+    unsigned Level = I + 1;
+    if (DRFDeps.get(CommonLoops[I], Src, Dst) ==
+        DRFLoopDependenceKind::NoCrossIteration) {
+      DRFLevels.push_back(Level);
+      continue;
+    }
+    if (!DRFDARequireEQPrefix)
+      continue;
+    unsigned Direction = Dependence::DVEntry::ALL;
+    if (!Result->isConfused() && Level <= Result->getLevels())
+      Direction = Result->getDirection(Level);
+    if (Direction != Dependence::DVEntry::EQ)
+      break;
+  }
+  if (DRFLevels.empty())
+    return Result;
+
+  // A confused result carries no direction vector.  Preserve that uncertainty
+  // at serial levels, while materializing EQ at each qualifying Tapir level.
+  if (Result->isConfused()) {
+    auto Refined = std::make_unique<FullDependence>(
+        Src, Dst, Result->getRuntimeAssumptions(),
+        /*PossiblyLoopIndependent=*/true, CommonLoops.size());
+    Refined->Consistent = false;
+    Result = std::move(Refined);
+  }
+
+  auto *Full = static_cast<FullDependence *>(Result.get());
+  Value *Ptr = getLoadStorePointerOperand(Src);
+  if (!Ptr)
+    return Result;
+  Type *DistanceTy = SE->getEffectiveSCEVType(Ptr->getType());
+  const SCEV *Zero = SE->getZero(DistanceTy);
+
+  for (unsigned Level : DRFLevels) {
+    if (Level > Full->Levels)
+      continue;
+    Dependence::DVEntry &Entry = Full->DV[Level - 1];
+    Entry.Direction = Dependence::DVEntry::EQ;
+    Entry.Distance = Zero;
+    Entry.PeelFirst = false;
+    Entry.PeelLast = false;
+    Entry.Splitable = false;
+  }
+
+  // EQ at the parallel levels still permits a dependence between accesses in
+  // the same dynamic iteration.  Keep that possibility so clients preserve
+  // the source order within each iteration.
+  Full->LoopIndependent = true;
+  Full->Consistent = false;
+  return Result;
 }
 
 // depends -
@@ -3665,8 +3809,8 @@ SCEVUnionPredicate DependenceInfo::getRuntimeAssumptions() const {
 // Care is required to keep the routine below, getSplitIteration(),
 // up to date with respect to this routine.
 std::unique_ptr<Dependence>
-DependenceInfo::depends(Instruction *Src, Instruction *Dst,
-                        bool UnderRuntimeAssumptions) {
+DependenceInfo::dependsImpl(Instruction *Src, Instruction *Dst,
+                            bool UnderRuntimeAssumptions) {
   SmallVector<const SCEVPredicate *, 4> Assume;
   bool PossiblyLoopIndependent = true;
   if (Src == Dst)

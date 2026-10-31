@@ -22,7 +22,12 @@ class Function;
 
 class LoopFusePass : public PassInfoMixin<LoopFusePass> {
 public:
+  explicit LoopFusePass(bool TapirDerivedOnly = false)
+      : TapirDerivedOnly(TapirDerivedOnly) {}
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+
+private:
+  bool TapirDerivedOnly;
 };
 
 } // end namespace llvm

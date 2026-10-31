@@ -1224,34 +1224,38 @@ void OpenCilkABI::lowerReducerOperation(CallBase *CI) {
     break;
   case Intrinsic::reducer_register: {
     IRBuilder<> Builder(CI);
+    SmallVector<Value *, 2> Args;
     switch (cast<ConstantInt>(CI->getArgOperand(0))->getZExtValue()) {
     case 0:
       Fn = Get__cilkrts_reducer_register_0();
-      if (Fn) {
-        assert(Fn.getFunctionType()->getNumParams() == 1);
-        CI->replaceAllUsesWith(Builder.CreateCall(Fn, {CI->getArgOperand(1)}));
-      }
-      return;
+      Args.push_back(CI->getArgOperand(1));
+      break;
     case 1:
       Fn = Get__cilkrts_reducer_register_1();
-      if (Fn) {
-        assert(Fn.getFunctionType()->getNumParams() == 2);
-        CI->replaceAllUsesWith(Builder.CreateCall(
-            Fn, {CI->getArgOperand(1), CI->getArgOperand(2)}));
-      }
-      return;
+      Args.push_back(CI->getArgOperand(1));
+      Args.push_back(CI->getArgOperand(2));
+      break;
     case 2:
       Fn = Get__cilkrts_reducer_register_2();
-      if (Fn) {
-        assert(Fn.getFunctionType()->getNumParams() == 2);
-        CI->replaceAllUsesWith(Builder.CreateCall(
-            Fn, {CI->getArgOperand(1), CI->getArgOperand(2)}));
-      }
-      return;
+      Args.push_back(CI->getArgOperand(1));
+      Args.push_back(CI->getArgOperand(2));
+      break;
     default:
       llvm_unreachable("invalid reducer register variant");
     }
-    break;
+
+    if (!Fn)
+      return;
+    assert(Fn.getFunctionType()->getNumParams() == Args.size());
+
+    // The runtime registration call replaces the intrinsic.  Leaving the
+    // intrinsic behind lets a later Tapir-lowering invocation register the
+    // same key again, which corrupts the dynamic hyperobject lifetime.
+    CallInst *RuntimeCall = Builder.CreateCall(Fn, Args);
+    RuntimeCall->setDebugLoc(CI->getDebugLoc());
+    CI->replaceAllUsesWith(RuntimeCall);
+    CI->eraseFromParent();
+    return;
   }
   case Intrinsic::reducer_unregister:
     Fn = Get__cilkrts_reducer_unregister();

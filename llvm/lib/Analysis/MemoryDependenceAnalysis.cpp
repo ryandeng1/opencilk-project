@@ -21,9 +21,12 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/DataRaceFreeAliasAnalysis.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/PHITransAddr.h"
+#include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TapirTaskInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -68,6 +71,9 @@ STATISTIC(NumCacheDirtyNonLocalPtr,
 STATISTIC(NumUncacheNonLocalPtr, "Number of uncached non-local ptr responses");
 STATISTIC(NumCacheCompleteNonLocalPtr,
           "Number of block queries that were completely cached");
+STATISTIC(NumDRFInvariantLoadClobbersSkipped,
+          "Number of MemDep store clobbers suppressed by the loop-scoped DRF "
+          "invariant-load proof");
 
 // Limit for the number of instructions to scan in a block.
 
@@ -376,13 +382,56 @@ static bool canSkipClobberingStore(const StoreInst *SI,
   return true;
 }
 
+bool MemoryDependenceResults::isDRFScopedInvariantLoadQuery(
+    const Instruction *QueryInst) const {
+  const auto *Load = dyn_cast_or_null<LoadInst>(QueryInst);
+  if (!EnableDRF || !TI || !LI || !SE || !Load ||
+      !isOrdinaryDRFMemoryAccess(Load))
+    return false;
+
+  // This test is deliberately broader than the final proof. It is used only
+  // to disable a cache keyed by pointer rather than by querying instruction.
+  // Bypassing a few extra entries is preferable to reusing an unconditional
+  // load's result for a conditional load at the same address.
+  for (const Loop *L = LI->getLoopFor(Load->getParent()); L;
+       L = L->getParentLoop())
+    if (isDRFLogicallyParallelLoop(L, TI) &&
+        L->isLoopInvariant(Load->getPointerOperand()))
+      return true;
+  return false;
+}
+
+bool MemoryDependenceResults::canSkipDRFInvariantLoadClobber(
+    const Instruction *QueryInst, const StoreInst *Clobber,
+    const MemoryLocation &QueryLoc) const {
+  const auto *Load = dyn_cast_or_null<LoadInst>(QueryInst);
+  if (!EnableDRF || !TI || !LI || !SE || !Load || !Clobber)
+    return false;
+
+  // A nonlocal MemDep query can carry a PHI-translated location. The DRF
+  // helper reasons about the actual load instruction, so accept only the
+  // invariant-pointer case where no translation changed the queried address.
+  if (QueryLoc.Ptr != Load->getPointerOperand())
+    return false;
+
+  for (const Loop *L = LI->getLoopFor(Load->getParent()); L;
+       L = L->getParentLoop()) {
+    if (!drfInvariantLoadClobberWouldRace(L, *TI, Load, Clobber, SE))
+      continue;
+    ++NumDRFInvariantLoadClobbersSkipped;
+    LLVM_DEBUG(dbgs() << "MemDep: DRF suppressing invariant-load clobber: "
+                      << *Clobber << " for " << *Load << '\n');
+    return true;
+  }
+  return false;
+}
+
 MemDepResult MemoryDependenceResults::getSimplePointerDependencyFrom(
     const MemoryLocation &MemLoc, bool isLoad, BasicBlock::iterator ScanIt,
     BasicBlock *BB, Instruction *QueryInst, unsigned *Limit,
     BatchAAResults &BatchAA) {
   bool isInvariantLoad = false;
-  Align MemLocAlign =
-      MemLoc.Ptr->getPointerAlignment(BB->getDataLayout());
+  Align MemLocAlign = MemLoc.Ptr->getPointerAlignment(BB->getDataLayout());
 
   unsigned DefaultLimit = getDefaultBlockScanLimit();
   if (!Limit)
@@ -590,6 +639,11 @@ MemDepResult MemoryDependenceResults::getSimplePointerDependencyFrom(
       if (R == AliasResult::MustAlias)
         return MemDepResult::getDef(Inst);
       if (isInvariantLoad)
+        continue;
+      // DRF resolves only ordinary AA uncertainty. A proven MustAlias store
+      // returned above, and a PartialAlias store remains a real clobber.
+      if (R == AliasResult::MayAlias &&
+          canSkipDRFInvariantLoadClobber(QueryInst, SI, MemLoc))
         continue;
       if (canSkipClobberingStore(SI, MemLoc, MemLocAlign, BatchAA, *Limit))
         continue;
@@ -914,10 +968,10 @@ MemDepResult MemoryDependenceResults::getNonLocalInfoForBlock(
     BasicBlock *BB, NonLocalDepInfo *Cache, unsigned NumSortedEntries,
     BatchAAResults &BatchAA) {
 
-  bool isInvariantLoad = false;
+  bool isInvariantLoad = isDRFScopedInvariantLoadQuery(QueryInst);
 
   if (LoadInst *LI = dyn_cast_or_null<LoadInst>(QueryInst))
-    isInvariantLoad = LI->getMetadata(LLVMContext::MD_invariant_load);
+    isInvariantLoad |= LI->getMetadata(LLVMContext::MD_invariant_load) != nullptr;
 
   // Do a binary search to see if we already have an entry for this block in
   // the cache set.  If so, find it.
@@ -1058,9 +1112,9 @@ bool MemoryDependenceResults::getNonLocalPointerDepFromBB(
   InitialNLPI.Size = Loc.Size;
   InitialNLPI.AATags = Loc.AATags;
 
-  bool isInvariantLoad = false;
+  bool isInvariantLoad = isDRFScopedInvariantLoadQuery(QueryInst);
   if (LoadInst *LI = dyn_cast_or_null<LoadInst>(QueryInst))
-    isInvariantLoad = LI->getMetadata(LLVMContext::MD_invariant_load);
+    isInvariantLoad |= LI->getMetadata(LLVMContext::MD_invariant_load) != nullptr;
 
   // Get the NLPI for CacheKey, inserting one into the map if it doesn't
   // already have one.
@@ -1723,7 +1777,10 @@ MemoryDependenceAnalysis::run(Function &F, FunctionAnalysisManager &AM) {
   auto &TLI = AM.getResult<TargetLibraryAnalysis>(F);
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
   auto *TI = EnableDRF ? &AM.getResult<TaskAnalysis>(F) : nullptr;
-  return MemoryDependenceResults(AA, AC, TLI, DT, DefaultBlockScanLimit, TI);
+  auto *LI = EnableDRF ? &AM.getResult<LoopAnalysis>(F) : nullptr;
+  auto *SE = EnableDRF ? &AM.getResult<ScalarEvolutionAnalysis>(F) : nullptr;
+  return MemoryDependenceResults(AA, AC, TLI, DT, DefaultBlockScanLimit, TI,
+                                 LI, SE);
 }
 
 char MemoryDependenceWrapperPass::ID = 0;
@@ -1733,6 +1790,8 @@ INITIALIZE_PASS_BEGIN(MemoryDependenceWrapperPass, "memdep",
 INITIALIZE_PASS_DEPENDENCY(AssumptionCacheTracker)
 INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(TaskInfoWrapperPass)
 INITIALIZE_PASS_END(MemoryDependenceWrapperPass, "memdep",
@@ -1750,14 +1809,18 @@ void MemoryDependenceWrapperPass::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesAll();
   AU.addRequired<AssumptionCacheTracker>();
   AU.addRequired<DominatorTreeWrapperPass>();
-  if (EnableDRF)
+  if (EnableDRF) {
     AU.addRequired<TaskInfoWrapperPass>();
+    AU.addRequired<LoopInfoWrapperPass>();
+    AU.addRequired<ScalarEvolutionWrapperPass>();
+  }
   AU.addRequiredTransitive<AAResultsWrapperPass>();
   AU.addRequiredTransitive<TargetLibraryInfoWrapperPass>();
 }
 
-bool MemoryDependenceResults::invalidate(Function &F, const PreservedAnalyses &PA,
-                               FunctionAnalysisManager::Invalidator &Inv) {
+bool MemoryDependenceResults::invalidate(
+    Function &F, const PreservedAnalyses &PA,
+    FunctionAnalysisManager::Invalidator &Inv) {
   // Check whether our analysis is preserved.
   auto PAC = PA.getChecker<MemoryDependenceAnalysis>();
   if (!PAC.preserved() && !PAC.preservedSet<AllAnalysesOn<Function>>())
@@ -1768,6 +1831,11 @@ bool MemoryDependenceResults::invalidate(Function &F, const PreservedAnalyses &P
   if (Inv.invalidate<AAManager>(F, PA) ||
       Inv.invalidate<AssumptionAnalysis>(F, PA) ||
       Inv.invalidate<DominatorTreeAnalysis>(F, PA))
+    return true;
+
+  if (TI && (Inv.invalidate<TaskAnalysis>(F, PA) ||
+             Inv.invalidate<LoopAnalysis>(F, PA) ||
+             Inv.invalidate<ScalarEvolutionAnalysis>(F, PA)))
     return true;
 
   // Otherwise this analysis result remains valid.
@@ -1785,6 +1853,10 @@ bool MemoryDependenceWrapperPass::runOnFunction(Function &F) {
   auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   auto *TI =
       EnableDRF ? &getAnalysis<TaskInfoWrapperPass>().getTaskInfo() : nullptr;
-  MemDep.emplace(AA, AC, TLI, DT, BlockScanLimit, TI);
+  auto *LI =
+      EnableDRF ? &getAnalysis<LoopInfoWrapperPass>().getLoopInfo() : nullptr;
+  auto *SE =
+      EnableDRF ? &getAnalysis<ScalarEvolutionWrapperPass>().getSE() : nullptr;
+  MemDep.emplace(AA, AC, TLI, DT, BlockScanLimit, TI, LI, SE);
   return false;
 }

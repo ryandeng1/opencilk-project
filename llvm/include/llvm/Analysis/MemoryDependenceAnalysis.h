@@ -30,7 +30,9 @@ namespace llvm {
 
 class AssumptionCache;
 class DominatorTree;
+class LoopInfo;
 class PHITransAddr;
+class ScalarEvolution;
 class TaskInfo;
 
 /// A memory dependence query can return one of three different answers.
@@ -358,6 +360,8 @@ private:
   PredIteratorCache PredCache;
   EarliestEscapeAnalysis EEA;
   TaskInfo *TI;
+  LoopInfo *LI;
+  ScalarEvolution *SE;
 
   unsigned DefaultBlockScanLimit;
 
@@ -369,8 +373,9 @@ public:
   MemoryDependenceResults(AAResults &AA, AssumptionCache &AC,
                           const TargetLibraryInfo &TLI, DominatorTree &DT,
                           unsigned DefaultBlockScanLimit,
-                          TaskInfo *TI = nullptr)
-      : AA(AA), AC(AC), TLI(TLI), DT(DT), EEA(DT), TI(TI),
+                          TaskInfo *TI = nullptr, LoopInfo *LI = nullptr,
+                          ScalarEvolution *SE = nullptr)
+      : AA(AA), AC(AC), TLI(TLI), DT(DT), EEA(DT), TI(TI), LI(LI), SE(SE),
         DefaultBlockScanLimit(DefaultBlockScanLimit) {}
 
   /// Handle invalidation in the new PM.
@@ -487,17 +492,27 @@ public:
   }
 
 private:
+  /// Return true when this particular load query may use the loop-scoped DRF
+  /// invariant-load rule. Such queries bypass the pointer-only nonlocal cache,
+  /// because the proof depends on the load's execution context.
+  bool isDRFScopedInvariantLoadQuery(const Instruction *QueryInst) const;
+
+  /// Resolve a MayAlias store clobber using the invariant-load DRF rule. This
+  /// never changes MustAlias or PartialAlias results and therefore does not
+  /// manufacture a global no-alias fact.
+  bool canSkipDRFInvariantLoadClobber(const Instruction *QueryInst,
+                                      const StoreInst *Clobber,
+                                      const MemoryLocation &QueryLoc) const;
+
   MemDepResult getCallDependencyFrom(CallBase *Call, bool isReadOnlyCall,
                                      BasicBlock::iterator ScanIt,
                                      BasicBlock *BB);
-  bool getNonLocalPointerDepFromBB(Instruction *QueryInst,
-                                   const PHITransAddr &Pointer,
-                                   const MemoryLocation &Loc, bool isLoad,
-                                   BasicBlock *BB,
-                                   SmallVectorImpl<NonLocalDepResult> &Result,
-                                   SmallDenseMap<BasicBlock *, Value *, 16> &Visited,
-                                   bool SkipFirstBlock = false,
-                                   bool IsIncomplete = false);
+  bool getNonLocalPointerDepFromBB(
+      Instruction *QueryInst, const PHITransAddr &Pointer,
+      const MemoryLocation &Loc, bool isLoad, BasicBlock *BB,
+      SmallVectorImpl<NonLocalDepResult> &Result,
+      SmallDenseMap<BasicBlock *, Value *, 16> &Visited,
+      bool SkipFirstBlock = false, bool IsIncomplete = false);
   MemDepResult getNonLocalInfoForBlock(Instruction *QueryInst,
                                        const MemoryLocation &Loc, bool isLoad,
                                        BasicBlock *BB, NonLocalDepInfo *Cache,

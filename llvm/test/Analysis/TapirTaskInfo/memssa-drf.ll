@@ -25,7 +25,8 @@ det.cont:                                         ; preds = %det.achd, %entry
 ; CHECK-NEXT: store i32 5, ptr @x
 
 ; CHECK: det.cont:
-; CHECK: MemoryUse(1)
+; CHECK: MemoryPhi({entry,1},{det.achd,2})
+; CHECK-NEXT: MemoryUse(4)
 ; CHECK-NEXT: %1 = load i32, ptr @x
 
 ; Function Attrs: argmemonly nounwind

@@ -1908,36 +1908,46 @@ def int_tapir_loop_grainsize
 def int_task_frameaddress
     : Intrinsic<[llvm_ptr_ty], [llvm_i32_ty], [IntrWillReturn]>;
 
+// Reducer callback state lives in the key object for variant 0, in a separate
+// descriptor for variant 1, and in direct function-pointer operands for
+// variant 2.  Expose the corresponding ordinary-memory reads before lowering.
 def int_hyper_lookup_0
     : Intrinsic<[llvm_ptr_ty],
                 [llvm_ptr_ty], [
-                 IntrWillReturn, IntrReadMem, IntrInaccessibleMemOnly,
+                 IntrWillReturn, IntrReadMem,
+                 IntrInaccessibleMemOrArgMemOnly,
                  IntrStrandPure, IntrHyperView, IntrInjective,
-                 NonNull<RetIndex>, NonNull<ArgIndex<0>>
+                 NonNull<RetIndex>, NonNull<ArgIndex<0>>,
+                 ReadOnly<ArgIndex<0>>
                 ]>;
 
 def int_hyper_lookup_1
     : Intrinsic<[llvm_ptr_ty],
                 [llvm_ptr_ty, llvm_ptr_ty], [
-                 IntrWillReturn, IntrReadMem, IntrInaccessibleMemOnly,
+                 IntrWillReturn, IntrReadMem, IntrInaccessibleMemOrArgMemOnly,
                  IntrStrandPure, IntrHyperView, IntrInjective,
                  NonNull<RetIndex>, NonNull<ArgIndex<0>>,
-                 NonNull<ArgIndex<1>>
+                 NonNull<ArgIndex<1>>, ReadNone<ArgIndex<0>>,
+                 ReadOnly<ArgIndex<1>>
                 ]>;
 
 def int_hyper_lookup_2
     : Intrinsic<[llvm_ptr_ty],
                 [llvm_ptr_ty, llvm_anyint_ty, llvm_ptr_ty, llvm_ptr_ty], [
-                 IntrWillReturn, IntrReadMem, IntrInaccessibleMemOnly,
+                 IntrWillReturn, IntrReadMem,
+                 IntrInaccessibleMemOrArgMemOnly,
                  IntrStrandPure, IntrHyperView, IntrInjective,
-                 NonNull<RetIndex>, NonNull<ArgIndex<0>>
+                 NonNull<RetIndex>, NonNull<ArgIndex<0>>,
+                 ReadNone<ArgIndex<0>>, ReadNone<ArgIndex<2>>,
+                 ReadNone<ArgIndex<3>>
                 ]>;
 
 def int_reducer_register
     : Intrinsic<[], [llvm_i32_ty, llvm_ptr_ty, llvm_ptr_ty], [
-                 IntrWillReturn, IntrInaccessibleMemOnly,
+                 IntrWillReturn, IntrInaccessibleMemOrArgMemOnly,
                  IntrReducerRegister, ImmArg<ArgIndex<0>>,
-                 NonNull<ArgIndex<1>>
+                 NonNull<ArgIndex<1>>, ReadOnly<ArgIndex<1>>,
+                 ReadOnly<ArgIndex<2>>
                 ]>;
 
 def int_reducer_unregister

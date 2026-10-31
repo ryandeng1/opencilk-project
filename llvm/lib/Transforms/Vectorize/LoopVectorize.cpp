@@ -868,6 +868,26 @@ static void reportVectorization(OptimizationRemarkEmitter *ORE, Loop *TheLoop,
   });
 }
 
+/// Report successful vectorization when DRF changed at least one memory
+/// legality decision for the loop. This is an outcome marker, while the LAA
+/// analysis remarks retain the individual reasons.
+static void reportDRFVectorization(OptimizationRemarkEmitter *ORE,
+                                   Loop *TheLoop, const LoopAccessInfo &LAI) {
+  ORE->emit([&]() {
+    return OptimizationRemark(LV_NAME, "DRFVectorized", TheLoop->getStartLoc(),
+                              TheLoop->getHeader())
+           << "vectorized loop after DRF changed memory legality "
+           << "(bounds rescued: "
+           << ore::NV("BoundsRescued", LAI.usedDRFUncomputableBoundsRescue())
+           << ", runtime checks elided: "
+           << ore::NV("ChecksElided", LAI.getNumDRFRuntimeChecksElided())
+           << ", NoCrossIteration dependences: "
+           << ore::NV("NoCrossIterationDependences",
+                      LAI.getNumDRFNoCrossIterationDependences())
+           << ")";
+  });
+}
+
 } // end namespace llvm
 
 namespace llvm {
@@ -9471,6 +9491,9 @@ static bool processLoopInVPlanNativePath(
   }
 
   reportVectorization(ORE, L, VF, 1);
+  if (const LoopAccessInfo *LAI = LVL->getLAI();
+      LAI && LAI->usedDRFMemoryLegality())
+    reportDRFVectorization(ORE, L, *LAI);
 
   // Mark the loop as already vectorized to avoid vectorizing again.
   Hints.setAlreadyVectorized();
@@ -10318,6 +10341,9 @@ bool LoopVectorizePass::processLoop(Loop *L) {
       }
       // Report the vectorization decision.
       reportVectorization(ORE, L, VF, IC);
+      if (const LoopAccessInfo *LAI = LVL.getLAI();
+          LAI && LAI->usedDRFMemoryLegality())
+        reportDRFVectorization(ORE, L, *LAI);
     }
 
     if (ORE->allowExtraAnalysis(LV_NAME))

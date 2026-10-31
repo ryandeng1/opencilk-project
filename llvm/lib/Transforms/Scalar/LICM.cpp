@@ -179,7 +179,8 @@ static bool isNotUsedOrFoldableInLoop(const Instruction &I, const Loop *CurLoop,
 static void hoist(Instruction &I, const DominatorTree *DT, const Loop *CurLoop,
                   BasicBlock *Dest, ICFLoopSafetyInfo *SafetyInfo,
                   MemorySSAUpdater &MSSAU, ScalarEvolution *SE,
-                  const TaskInfo *TI, OptimizationRemarkEmitter *ORE);
+                  const TaskInfo *TI, OptimizationRemarkEmitter *ORE,
+                  bool UsedDRFClobberSuppression = false);
 static bool sink(Instruction &I, LoopInfo *LI, DominatorTree *DT,
                  const Loop *CurLoop, ICFLoopSafetyInfo *SafetyInfo,
                  MemorySSAUpdater &MSSAU, OptimizationRemarkEmitter *ORE);
@@ -191,10 +192,11 @@ static bool isSafeToExecuteUnconditionally(
 static bool noConflictingReadWrites(Instruction *I, MemorySSA *MSSA,
                                     AAResults *AA, Loop *CurLoop,
                                     SinkAndHoistLICMFlags &Flags);
-static bool pointerInvalidatedByLoop(MemorySSA *MSSA, MemoryUse *MU,
-                                     Loop *CurLoop, Instruction &I,
-                                     SinkAndHoistLICMFlags &Flags,
-                                     bool InvariantGroup);
+static bool
+pointerInvalidatedByLoop(MemorySSA *MSSA, MemoryUse *MU, Loop *CurLoop,
+                         Instruction &I, SinkAndHoistLICMFlags &Flags,
+                         bool InvariantGroup,
+                         MemorySSAClobberReason *ClobberReason = nullptr);
 static bool pointerInvalidatedByBlock(BasicBlock &BB, MemorySSA &MSSA,
                                       MemoryUse &MU);
 /// Aggregates various functions for hoisting computations out of loop.
@@ -925,13 +927,15 @@ bool llvm::hoistRegion(DomTreeNode *N, AAResults *AA, LoopInfo *LI,
       // TODO: It may be safe to hoist if we are hoisting to a conditional block
       // and we have accurately duplicated the control flow from the loop header
       // to that block.
+      bool UsedDRFClobberSuppression = false;
       if (CurLoop->hasLoopInvariantOperands(&I) &&
-          canSinkOrHoistInst(I, AA, DT, CurLoop, MSSAU, true, TI, Flags, ORE) &&
-          isSafeToExecuteUnconditionally(
-              I, DT, TLI, CurLoop, SafetyInfo, TI, ORE,
-              Preheader->getTerminator(), AC, AllowSpeculation)) {
+          canSinkOrHoistInst(I, AA, DT, CurLoop, MSSAU, true, TI, Flags, ORE,
+                             &UsedDRFClobberSuppression) &&
+          isSafeToExecuteUnconditionally(I, DT, TLI, CurLoop, SafetyInfo, TI,
+                                         ORE, Preheader->getTerminator(), AC,
+                                         AllowSpeculation)) {
         hoist(I, DT, CurLoop, CFH.getOrCreateHoistedBlock(BB), SafetyInfo,
-              MSSAU, SE, TI, ORE);
+              MSSAU, SE, TI, ORE, UsedDRFClobberSuppression);
         HoistedInstructions.push_back(&I);
         Changed = true;
         continue;
@@ -1164,11 +1168,30 @@ static MemoryAccess *getClobberingMemoryAccess(MemorySSA &MSSA,
   return Source;
 }
 
+static MemorySSAClobberingAccessResult getClobberingMemoryAccessWithReason(
+    MemorySSA &MSSA, BatchAAResults &BAA, SinkAndHoistLICMFlags &Flags,
+    MemoryUseOrDef *MA, const Loop *DRFScope) {
+  // Keep the existing LICM compile-time cap.  Falling back to the defining
+  // edge is conservative and intentionally carries no DRF attribution.
+  if (Flags.tooManyClobberingCalls())
+    return {MA->getDefiningAccess(), MemorySSAClobberReason::None};
+
+  MemorySSAClobberingAccessResult Result =
+      MSSA.getSkipSelfWalker()->getClobberingMemoryAccessWithReason(MA, BAA,
+                                                                    DRFScope);
+  Flags.incrementClobberingCalls();
+  return Result;
+}
+
 bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
                               Loop *CurLoop, MemorySSAUpdater &MSSAU,
                               bool TargetExecutesOncePerLoop, TaskInfo *TI,
                               SinkAndHoistLICMFlags &Flags,
-                              OptimizationRemarkEmitter *ORE) {
+                              OptimizationRemarkEmitter *ORE,
+                              bool *UsedDRFClobberSuppression) {
+  if (UsedDRFClobberSuppression)
+    *UsedDRFClobberSuppression = false;
+
   // If we don't understand the instruction, bail early.
   if (!isHoistableAndSinkableInst(I))
     return false;
@@ -1197,8 +1220,9 @@ bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
 
     bool InvariantGroup = LI->hasMetadata(LLVMContext::MD_invariant_group);
 
-    bool Invalidated = pointerInvalidatedByLoop(
-        MSSA, MU, CurLoop, I, Flags, InvariantGroup);
+    MemorySSAClobberReason ClobberReason = MemorySSAClobberReason::None;
+    bool Invalidated = pointerInvalidatedByLoop(MSSA, MU, CurLoop, I, Flags,
+                                                InvariantGroup, &ClobberReason);
     // Check loop-invariant address because this may also be a sinkable load
     // whose address is not necessarily loop-invariant.
     if (ORE && Invalidated && CurLoop->isLoopInvariant(LI->getPointerOperand()))
@@ -1209,6 +1233,9 @@ bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
                   "because the loop may invalidate its value";
       });
 
+    if (!Invalidated && UsedDRFClobberSuppression)
+      *UsedDRFClobberSuppression =
+          ClobberReason != MemorySSAClobberReason::None;
     return !Invalidated;
   } else if (CallInst *CI = dyn_cast<CallInst>(&I)) {
     // Don't sink calls which can throw.
@@ -1697,13 +1724,19 @@ static bool sink(Instruction &I, LoopInfo *LI, DominatorTree *DT,
 static void hoist(Instruction &I, const DominatorTree *DT, const Loop *CurLoop,
                   BasicBlock *Dest, ICFLoopSafetyInfo *SafetyInfo,
                   MemorySSAUpdater &MSSAU, ScalarEvolution *SE,
-                  const TaskInfo *TI, OptimizationRemarkEmitter *ORE) {
+                  const TaskInfo *TI, OptimizationRemarkEmitter *ORE,
+                  bool UsedDRFClobberSuppression) {
   LLVM_DEBUG(dbgs() << "LICM hoisting to " << Dest->getNameOrAsOperand() << ": "
                     << I << "\n");
   ORE->emit([&]() {
-    return OptimizationRemark(DEBUG_TYPE, "Hoisted", &I) << "hoisting "
-                                                         << ore::NV("Inst", &I);
+    return OptimizationRemark(DEBUG_TYPE, "Hoisted", &I)
+           << "hoisting " << ore::NV("Inst", &I);
   });
+  if (UsedDRFClobberSuppression && isa<LoadInst>(I))
+    ORE->emit([&]() {
+      return OptimizationRemark(DEBUG_TYPE, "DRFHoistedLoad", &I)
+             << "hoisted load after DRF suppressed a loop-local clobber";
+    });
 
   // Metadata can be dependent on conditions we are hoisting above.
   // Conservatively strip all metadata on the instruction unless we were
@@ -2439,7 +2472,11 @@ static bool noConflictingReadWrites(Instruction *I, MemorySSA *MSSA,
 static bool pointerInvalidatedByLoop(MemorySSA *MSSA, MemoryUse *MU,
                                      Loop *CurLoop, Instruction &I,
                                      SinkAndHoistLICMFlags &Flags,
-                                     bool InvariantGroup) {
+                                     bool InvariantGroup,
+                                     MemorySSAClobberReason *ClobberReason) {
+  if (ClobberReason)
+    *ClobberReason = MemorySSAClobberReason::None;
+
   // For hoisting, use the walker to determine safety
   if (!Flags.getIsSink()) {
     // If hoisting an invariant group, we only need to check that there
@@ -2452,10 +2489,15 @@ static bool pointerInvalidatedByLoop(MemorySSA *MSSA, MemoryUse *MU,
     // if the memory loaded is the phi node
 
     BatchAAResults BAA(MSSA->getAA());
-    MemoryAccess *Source = getClobberingMemoryAccess(*MSSA, BAA, Flags, MU);
+    MemorySSAClobberingAccessResult Clobber =
+        getClobberingMemoryAccessWithReason(*MSSA, BAA, Flags, MU, CurLoop);
+    if (ClobberReason)
+      *ClobberReason = Clobber.Reason;
+    MemoryAccess *Source = Clobber.Access;
     return !MSSA->isLiveOnEntryDef(Source) &&
            CurLoop->contains(Source->getBlock()) &&
-           !(InvariantGroup && Source->getBlock() == CurLoop->getHeader() && isa<MemoryPhi>(Source));
+           !(InvariantGroup && Source->getBlock() == CurLoop->getHeader() &&
+             isa<MemoryPhi>(Source));
   }
 
   // For sinking, we'd need to check all Defs below this use. The getClobbering

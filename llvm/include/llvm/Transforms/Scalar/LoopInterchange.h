@@ -18,8 +18,13 @@ class LPMUpdater;
 class LoopNest;
 
 struct LoopInterchangePass : public PassInfoMixin<LoopInterchangePass> {
+  explicit LoopInterchangePass(bool TapirDerivedOnly = false)
+      : TapirDerivedOnly(TapirDerivedOnly) {}
   PreservedAnalyses run(LoopNest &L, LoopAnalysisManager &AM,
                         LoopStandardAnalysisResults &AR, LPMUpdater &U);
+
+private:
+  bool TapirDerivedOnly;
 };
 
 } // end namespace llvm

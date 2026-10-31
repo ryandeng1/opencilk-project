@@ -298,6 +298,52 @@ static bool effectivelyArgMemOnly(const CallBase *Call, AAQueryInfo &AAQI) {
   return Call->isStrandPure() && AAQI.AssumeSameSpindle;
 }
 
+// Return the registry key used by a hyperobject-view lookup.  A strand-pure
+// lookup is stable only while this key remains registered.
+static const Value *getHyperViewKey(const CallBase *Call) {
+  if (!Call->hasFnAttr(Attribute::HyperView) || Call->arg_empty())
+    return nullptr;
+  return Call->getArgOperand(0);
+}
+
+// Return the registry key whose lifetime is changed by this call.  The
+// reducer.register intrinsic carries a leading variant argument; other calls
+// carrying the reducer-register attribute take the key as their first argument.
+static const Value *getReducerLifetimeKey(const CallBase *Call) {
+  if (Call->hasFnAttr(Attribute::ReducerRegister)) {
+    const Function *Callee = Call->getCalledFunction();
+    if (Callee && Callee->getIntrinsicID() == Intrinsic::reducer_register)
+      return Call->arg_size() > 1 ? Call->getArgOperand(1) : nullptr;
+    return Call->arg_empty() ? nullptr : Call->getArgOperand(0);
+  }
+
+  if (Call->hasFnAttr(Attribute::ReducerUnregister))
+    return Call->arg_empty() ? nullptr : Call->getArgOperand(0);
+
+  return nullptr;
+}
+
+// A hyperobject lookup is strand-pure within one registration lifetime, not
+// across register/unregister operations.  Model a lifetime operation as a
+// clobber unless AA proves that it changes a different registry key.
+static bool reducerLifetimeMayClobberHyperView(const CallBase *Call1,
+                                               const CallBase *Call2,
+                                               AAResults &AA,
+                                               AAQueryInfo &AAQI) {
+  const Value *LifetimeKey = getReducerLifetimeKey(Call1);
+  const Value *ViewKey = getHyperViewKey(Call2);
+  if (!LifetimeKey || !ViewKey) {
+    LifetimeKey = getReducerLifetimeKey(Call2);
+    ViewKey = getHyperViewKey(Call1);
+  }
+  if (!LifetimeKey || !ViewKey)
+    return false;
+
+  return AA.alias(MemoryLocation::getBeforeOrAfter(LifetimeKey),
+                  MemoryLocation::getBeforeOrAfter(ViewKey),
+                  AAQI) != AliasResult::NoAlias;
+}
+
 ModRefInfo AAResults::getModRefInfo(const CallBase *Call,
                                     const MemoryLocation &Loc,
                                     AAQueryInfo &AAQI) {
@@ -322,6 +368,12 @@ ModRefInfo AAResults::getModRefInfo(const CallBase *Call,
 
 ModRefInfo AAResults::getModRefInfo(const CallBase *Call1,
                                     const CallBase *Call2, AAQueryInfo &AAQI) {
+  // Same-spindle queries normally treat strand-pure calls as accessing only
+  // argument memory.  Preserve the inaccessible-memory dependence that marks
+  // the start and end of a hyperobject key's dynamic registration lifetime.
+  if (reducerLifetimeMayClobberHyperView(Call1, Call2, *this, AAQI))
+    return ModRefInfo::ModRef;
+
   ModRefInfo Result = ModRefInfo::ModRef;
 
   for (const auto &AA : AAs) {

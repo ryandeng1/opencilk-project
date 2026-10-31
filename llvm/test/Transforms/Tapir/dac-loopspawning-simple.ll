@@ -77,7 +77,7 @@ pfor.inc:                                         ; preds = %pfor.body, %pfor.de
 ; CHECK-NEXT: [[LOCALCMP:%[a-zA-Z0-9._]+]] = icmp eq {{.*}} [[NEXTITER]], [[END]]
   %inc = add nuw nsw i32 %i.06, 1
   %exitcond = icmp eq i32 %inc, %n
-; CHECK: br i1 [[LOCALCMP]]
+; CHECK: br i1 [[LOCALCMP]]{{.*}}!llvm.loop ![[SERIAL_LOOP:[0-9]+]]
   br i1 %exitcond, label %pfor.cond.cleanup.loopexit, label %pfor.detach, !llvm.loop !1
 
 ; CHECK: sync within [[NEWSYNCREG]]
@@ -95,3 +95,6 @@ attributes #3 = { argmemonly nounwind }
 
 !1 = distinct !{!1, !2}
 !2 = !{!"tapir.loop.spawn.strategy", i32 1}
+
+; CHECK: ![[SERIAL_LOOP]] = distinct !{![[SERIAL_LOOP]], {{.*}}![[FROM_TAPIR:[0-9]+]]}
+; CHECK: ![[FROM_TAPIR]] = !{!"llvm.loop.fromtapirloop"}
